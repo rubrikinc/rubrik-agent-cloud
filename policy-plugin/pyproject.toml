@@ -3,14 +3,13 @@ name = "rubrik-agent-cloud-policy-plugin"
 version = "0.1.0"
 description = "Rubrik Agent Cloud policy enforcement plugin for AI agent frameworks"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["httpx>=0.24.0"]
 authors = [{name = "Rubrik", email = "support@rubrik.com"}]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
