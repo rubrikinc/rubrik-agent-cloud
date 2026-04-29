@@ -1,0 +1,44 @@
+[project]
+name = "rubrik-agent-cloud-policy-plugin"
+version = "0.1.0"
+description = "Rubrik Agent Cloud policy enforcement plugin for AI agent frameworks"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.24.0"]
+authors = [{name = "Rubrik", email = "support@rubrik.com"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://www.rubrik.com/products/rubrik-agent-cloud"
+Documentation = "https://github.com/rubrikinc/rubrik-agent-cloud"
+
+[project.optional-dependencies]
+adk = ["google-adk>=1.19.0"]
+dev = [
+    "google-adk>=1.19.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-httpx>=0.30.0",
+    "respx>=0.21.0",
+]
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel"]
+
+[tool.setuptools]
+packages = ["rubrik_agent_cloud_policy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
