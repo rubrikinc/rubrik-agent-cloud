@@ -96,14 +96,14 @@ If the webhook is unreachable, the plugin **fails open** by default (all tools a
 cd policy-plugin
 pip install build
 python -m build
-# produces dist/rubrik_agent_cloud_policy_plugin-0.1.0-py3-none-any.whl
+# produces dist/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl
 ```
 
 ### 2. Upload to GCS (Agent Engine needs HTTP access during build)
 
 ```bash
-gsutil cp dist/rubrik_agent_cloud_policy_plugin-0.1.0-py3-none-any.whl gs://{bucket}/packages/
-gsutil acl ch -u AllUsers:R gs://{bucket}/packages/rubrik_agent_cloud_policy_plugin-0.1.0-py3-none-any.whl
+gsutil cp dist/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl gs://{bucket}/packages/
+gsutil acl ch -u AllUsers:R gs://{bucket}/packages/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl
 ```
 
 ### 3. Deploy
@@ -121,7 +121,7 @@ adk_app = agent_engines.AdkApp(
     plugins=[RubrikPolicyPlugin()],
 )
 
-WHEEL_URL = "https://storage.googleapis.com/{bucket}/packages/rubrik_agent_cloud_policy_plugin-0.1.0-py3-none-any.whl"
+WHEEL_URL = "https://storage.googleapis.com/{bucket}/packages/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl"
 
 remote_app = agent_engines.create(
     agent_engine=adk_app,

@@ -1,6 +1,6 @@
 [project]
 name = "rubrik-agent-cloud-policy-plugin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Rubrik Agent Cloud policy enforcement plugin for AI agent frameworks"
 readme = "README.md"
 license = "Apache-2.0"

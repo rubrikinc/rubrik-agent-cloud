@@ -15,7 +15,7 @@ Usage:
     # Deploy
     RUBRIK_WEBHOOK_URL=https://webhooks.your-dataplane.example.com \
     GOOGLE_API_KEY=<gemini-key> \
-    python -m examples.test_agent.deploy --wheel-url https://storage.googleapis.com/<bucket>/packages/rubrik_agent_cloud_policy_plugin-0.1.0-py3-none-any.whl
+    python -m examples.test_agent.deploy --wheel-url https://storage.googleapis.com/<bucket>/packages/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl
 """
 
 import argparse
