@@ -7,6 +7,7 @@ license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["httpx>=0.24.0"]
 authors = [{name = "Rubrik", email = "support@rubrik.com"}]
+keywords = ["rubrik", "agent-cloud", "policy", "ai-safety", "tool-blocking", "adk", "guardrails"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -20,7 +21,10 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://www.rubrik.com/products/rubrik-agent-cloud"
-Documentation = "https://github.com/rubrikinc/rubrik-agent-cloud"
+Documentation = "https://github.com/rubrikinc/rubrik-agent-cloud/tree/main/policy-plugin"
+Repository = "https://github.com/rubrikinc/rubrik-agent-cloud"
+Issues = "https://github.com/rubrikinc/rubrik-agent-cloud/issues"
+Changelog = "https://github.com/rubrikinc/rubrik-agent-cloud/releases"
 
 [project.optional-dependencies]
 adk = ["google-adk>=1.19.0"]
