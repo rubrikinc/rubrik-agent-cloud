@@ -1,0 +1,106 @@
+name: Build & Release rubrik-policy-plugin (tombstone)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "policy-plugin-tombstone/pyproject.toml"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get.outputs.version }}
+      tag: ${{ steps.get.outputs.tag }}
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: get
+        run: |
+          version=$(grep -m1 '^version' policy-plugin-tombstone/pyproject.toml | tr -d ' "' | cut -d= -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=rubrik-policy-plugin-tombstone/v$version" >> "$GITHUB_OUTPUT"
+
+      - id: check
+        run: |
+          tag="${{ steps.get.outputs.tag }}"
+          if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: policy-plugin-tombstone
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-tombstone
+          path: policy-plugin-tombstone/dist/
+
+  github-release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-tombstone
+          path: dist/
+
+      - name: Create tag
+        run: |
+          git tag "${{ needs.check-version.outputs.tag }}"
+          git push origin "${{ needs.check-version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          name: "rubrik-policy-plugin v${{ needs.check-version.outputs.version }} (DEPRECATED tombstone)"
+          files: dist/*
+          body: |
+            **This is a tombstone release.** The `rubrik-policy-plugin` package has been
+            renamed to [`rubrik-agent-cloud-policy-plugin`](https://pypi.org/project/rubrik-agent-cloud-policy-plugin/).
+
+            This release re-exports the new package under the old import path and emits
+            a `DeprecationWarning` at import time. Migrate to `rubrik-agent-cloud-policy-plugin`.
+
+  pypi-publish:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-tombstone
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

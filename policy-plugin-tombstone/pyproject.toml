@@ -1,0 +1,26 @@
+[project]
+name = "rubrik-policy-plugin"
+version = "0.2.0"
+description = "DEPRECATED — use rubrik-agent-cloud-policy-plugin instead"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = ["rubrik-agent-cloud-policy-plugin>=0.1.1"]
+authors = [{name = "Rubrik", email = "support@rubrik.com"}]
+classifiers = [
+    "Development Status :: 7 - Inactive",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://pypi.org/project/rubrik-agent-cloud-policy-plugin/"
+Repository = "https://github.com/rubrikinc/rubrik-agent-cloud"
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel"]
+
+[tool.setuptools]
+packages = ["rubrik_policy"]
