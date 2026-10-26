@@ -66,6 +66,8 @@ class _InvocationState:
     blocked_call_ids: set = field(default_factory=set)
     # Refusal for a blocked user prompt, returned by before_run_callback.
     prompt_refusal: Optional[str] = None
+    # Whether on_user_message_callback ran for this invocation.
+    message_checked: bool = False
 
 
 class RubrikPolicyPlugin(BasePlugin):
@@ -79,7 +81,9 @@ class RubrikPolicyPlugin(BasePlugin):
     - ``on_user_message_callback`` and ``before_run_callback``: check a new
       user prompt before it is saved to the session.  A blocked prompt is
       saved as a placeholder, and the run ends with the refusal before the
-      model is called.
+      model is called.  Tool results that the client sends in the message
+      (long-running tools) are checked too; a blocked one is replaced with
+      the refusal.
     - ``before_model_callback``: records the model request as context for
       the checks below.  It does not call the webhook.
     - ``after_model_callback``: checks the model response.  Blocked tool
@@ -93,10 +97,15 @@ class RubrikPolicyPlugin(BasePlugin):
     - ``after_tool_callback``: checks each tool result before the model
       sees it.  A blocked result is replaced with the refusal.
 
+    ADK stops calling plugins for a callback once one returns a value, so a
+    plugin earlier in the list could hide activity from this one.  At the
+    start of each run the plugin moves itself to the front of the runner's
+    plugin list.
+
     Construction defers client initialization until first use so the plugin
     can be created locally (for cloudpickle) without ``RUBRIK_WEBHOOK_URL``.
-    ``__reduce__`` delegates to ``RubrikPolicyClient.from_env()`` which
-    raises at unpickle time if the env var is missing.
+    Pickling drops the client, so the unpickled plugin builds it again from
+    its constructor arguments, or from the environment if there are none.
     """
 
     PLUGIN_NAME = "rubrik_agent_cloud_policy"
@@ -108,6 +117,12 @@ class RubrikPolicyPlugin(BasePlugin):
         # _get_policy_client() initializes on first callback invocation.
         self._policy_client: Optional[RubrikPolicyClient] = None
         self._invocations: dict[str, _InvocationState] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_policy_client"] = None
+        state["_invocations"] = {}
+        return state
 
     def _get_policy_client(self) -> RubrikPolicyClient:
         if self._policy_client is None:
@@ -136,36 +151,79 @@ class RubrikPolicyPlugin(BasePlugin):
     async def on_user_message_callback(
         self, *, invocation_context: Any, user_message: Any
     ) -> Any:
-        """Check a new user prompt before ADK saves it to the session."""
-        if not _is_user_prompt(user_message):
+        """Check a new user message before ADK saves it to the session.
+
+        Checks each tool result in the message and then its text.  Blocked
+        tool results are replaced with the refusal; blocked text is replaced
+        with a placeholder and the refusal is held for ``before_run_callback``.
+        """
+        self._move_to_front(invocation_context)
+        state = self._state(invocation_context)
+        state.message_checked = True
+        parts = list(getattr(user_message, "parts", None) or [])
+        if not parts:
             return None
 
-        try:
-            client = self._get_policy_client()
-            context = _session_context(
-                invocation_context, tail=_contents_to_messages([user_message])
+        changed = False
+        new_parts = []
+        tool_messages: list[dict[str, Any]] = []
+        for part in parts:
+            fr = part.function_response
+            if fr is None:
+                new_parts.append(part)
+                continue
+            message = _tool_result_message(fr.name or "", fr.id or "", fr.response)
+            refusal = await self._check_tail(
+                invocation_context, [*tool_messages, message], "Tool result withheld"
             )
-            refusal = await client.evaluate_prompt(context)
-        except _WEBHOOK_ERRORS:
-            log.exception(
-                "[%s] Webhook call failed in on_user_message_callback", self.PLUGIN_NAME
+            tool_messages.append(message)
+            if refusal is None:
+                new_parts.append(part)
+                continue
+            log.info("[%s] Blocked tool result: %s", self.PLUGIN_NAME, fr.name)
+            changed = True
+            new_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=fr.id, name=fr.name, response={"error": refusal}
+                    )
+                )
             )
-            if self._get_policy_client().fail_open:
-                return None
-            refusal = f"Request blocked: {_CHECK_UNAVAILABLE}"
 
-        if refusal is None:
+        text = "\n".join(p.text for p in parts if p.text and not getattr(p, "thought", None))
+        if text:
+            refusal = await self._check_tail(
+                invocation_context,
+                [*tool_messages, {"role": "user", "content": text}],
+                "Request blocked",
+            )
+            if refusal is not None:
+                log.info("[%s] Blocked user prompt", self.PLUGIN_NAME)
+                state.prompt_refusal = refusal
+                changed = True
+                new_parts = [p for p in new_parts if not p.text]
+                new_parts.append(types.Part(text=_REDACTED_PROMPT))
+
+        if not changed:
             return None
-        log.info("[%s] Blocked user prompt", self.PLUGIN_NAME)
-        self._state(invocation_context).prompt_refusal = refusal
-        return types.Content(role="user", parts=[types.Part(text=_REDACTED_PROMPT)])
+        return types.Content(role=user_message.role or "user", parts=new_parts)
 
     async def before_run_callback(self, *, invocation_context: Any) -> Any:
-        """End the run with the refusal when the user prompt was blocked."""
-        state = self._invocations.get(_invocation_id(invocation_context))
-        if state is None or state.prompt_refusal is None:
-            return None
+        """End the run with the refusal when the user prompt was blocked.
+
+        If an earlier plugin's ``on_user_message_callback`` returned a value,
+        this plugin's was skipped; the prompt is then checked here, after
+        ADK saved it but before the model is called.
+        """
+        self._move_to_front(invocation_context)
+        state = self._state(invocation_context)
         refusal, state.prompt_refusal = state.prompt_refusal, None
+        if refusal is None and not state.message_checked:
+            state.message_checked = True
+            if _is_user_prompt(getattr(invocation_context, "user_content", None)):
+                refusal = await self._check_tail(invocation_context, [], "Request blocked")
+        if refusal is None:
+            return None
         return types.Content(role="model", parts=[types.Part(text=refusal)])
 
     async def after_run_callback(self, *, invocation_context: Any) -> None:
@@ -192,15 +250,18 @@ class RubrikPolicyPlugin(BasePlugin):
         if not llm_response.content.parts:
             return None
 
+        # ADK runs tool calls only from non-partial responses: the final
+        # aggregated response in progressive SSE streaming, or the chunk
+        # itself otherwise.  Partial chunks are checked through that response.
+        if getattr(llm_response, "partial", False):
+            return None
+
         fc_parts = [
             (i, part)
             for i, part in enumerate(llm_response.content.parts)
             if part.function_call is not None
         ]
-        # Streamed text chunks are checked once ADK aggregates them into the
-        # final response.  Tool calls are checked in every response.
-        partial = bool(getattr(llm_response, "partial", False))
-        text = "" if partial else _response_text(llm_response.content)
+        text = _response_text(llm_response.content)
         if not fc_parts and not text:
             return None
 
@@ -223,10 +284,9 @@ class RubrikPolicyPlugin(BasePlugin):
             )
             return llm_response
 
-        if not partial:
-            approved = self._state(callback_context).approved_calls
-            for tc in result.allowed:
-                approved[_call_signature(tc.name, tc.arguments)] += 1
+        approved = self._state(callback_context).approved_calls
+        for tc in result.allowed:
+            approved[_call_signature(tc.name, tc.arguments)] += 1
 
         if not result.blocked:
             return None
@@ -309,7 +369,32 @@ class RubrikPolicyPlugin(BasePlugin):
         log.info("[%s] Blocked tool result: %s", self.PLUGIN_NAME, tool.name)
         return {"error": refusal}
 
-    # -- context --------------------------------------------------------------
+    # -- helpers --------------------------------------------------------------
+
+    def _move_to_front(self, invocation_context: Any) -> None:
+        plugins = getattr(
+            getattr(invocation_context, "plugin_manager", None), "plugins", None
+        )
+        if isinstance(plugins, list) and plugins and plugins[0] is not self and self in plugins:
+            plugins.remove(self)
+            plugins.insert(0, self)
+
+    async def _check_tail(
+        self, invocation_context: Any, tail: list[dict[str, Any]], unavailable_prefix: str
+    ) -> Optional[str]:
+        """Check the last of ``tail`` (after the session) with before_prompt.
+
+        Returns the refusal, or ``None`` when allowed.  On a webhook error
+        returns ``None`` when failing open, else an unavailability refusal.
+        """
+        try:
+            client = self._get_policy_client()
+            return await client.evaluate_prompt(_session_context(invocation_context, tail))
+        except _WEBHOOK_ERRORS:
+            log.exception("[%s] Webhook call failed checking a message", self.PLUGIN_NAME)
+            if self._get_policy_client().fail_open:
+                return None
+            return f"{unavailable_prefix}: {_CHECK_UNAVAILABLE}"
 
     def _model_context(self, callback_context: Any) -> PolicyContext:
         """The recorded model request, or the session if none was recorded."""

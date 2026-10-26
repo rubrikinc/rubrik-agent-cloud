@@ -77,14 +77,21 @@ The plugin checks four points in each ADK run. Each check sends the conversation
 
 | ADK callback | What is checked | Webhook endpoint | When blocked |
 |--------------|-----------------|------------------|--------------|
-| `on_user_message_callback` | User prompt | `/v1/before_prompt/openai/v1` | The prompt is saved to the session as a placeholder, and the run ends with the refusal before the model is called. |
+| `on_user_message_callback` | User prompt, and tool results the client sends back (long-running tools) | `/v1/before_prompt/openai/v1` | A blocked prompt is saved to the session as a placeholder, and the run ends with the refusal before the model is called. A blocked tool result is replaced with the refusal. |
 | `after_model_callback` | Model response: tool calls and text | `/v1/after_completion/openai/v1` | Blocked tool calls are removed before they run and an explanation is added. A blocked response is replaced with the refusal. |
 | `before_tool_callback` | A tool call that `after_model_callback` did not check | `/v1/after_completion/openai/v1` | The tool does not run; the model receives an error result. |
 | `after_tool_callback` | Tool result | `/v1/before_prompt/openai/v1` | The model receives an error result instead of the tool output. |
 
 `before_tool_callback` is a safety net for tool calls that skip `after_model_callback`, which happens when another plugin's `before_model_callback` returns a cached response. Tool calls that `after_model_callback` already allowed are not checked again.
 
-Streamed text chunks are not checked one by one; the final aggregated response is.
+Streamed chunks are not checked one by one; the response that ADK acts on is.
+
+ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list.
+
+Limitations:
+
+- When another plugin's `before_model_callback` returns a cached response, ADK skips `after_model_callback`. Tool calls in that response are still checked by `before_tool_callback`; its text is not checked.
+- In live (bidirectional streaming) mode, ADK does not call plugin tool callbacks or `on_user_message_callback`, so only `after_model_callback` runs.
 
 If the webhook is unreachable, the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: prompts, tool calls, and tool results are then blocked while the webhook is unavailable.
 

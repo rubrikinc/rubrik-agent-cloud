@@ -555,3 +555,188 @@ class TestAgentId:
             with patch.dict("os.environ", {"RUBRIK_AGENT_ID": "remote"}):
                 restored = pickle.loads(pickle.dumps(client))
         assert restored.agent_id == "remote"
+
+
+# -- plugin ordering, client-sent tool results, streaming -----------------------------
+
+
+class _ShortCircuitPlugin:
+    """Builds plugins that return a value from one callback, hiding it from
+    plugins later in the list."""
+
+    @staticmethod
+    def on_user_message():
+        from google.adk.plugins.base_plugin import BasePlugin
+
+        class P(BasePlugin):
+            async def on_user_message_callback(self, *, invocation_context, user_message):
+                return types.Content(role="user", parts=list(user_message.parts))
+
+        return P(name="rewrites_message")
+
+    @staticmethod
+    def after_tool():
+        from google.adk.plugins.base_plugin import BasePlugin
+
+        class P(BasePlugin):
+            async def after_tool_callback(self, *, tool, tool_args, tool_context, result):
+                return dict(result)
+
+        return P(name="copies_result")
+
+
+async def _run_with_plugins(script, plugins, prompt="go", new_message=None, session_service=None, session_id=None):
+    model = ScriptedModel(model="scripted", script=script, requests=[])
+    agent = Agent(
+        name="test_agent",
+        model=model,
+        instruction="You are a test agent.",
+        tools=[read_secret, post_to_pastebin, get_weather],
+    )
+    session_service = session_service or InMemorySessionService()
+    runner = Runner(agent=agent, app_name="app", session_service=session_service, plugins=plugins)
+    if session_id is None:
+        session_id = (await session_service.create_session(app_name="app", user_id="u")).id
+    events = []
+    async for event in runner.run_async(
+        user_id="u",
+        session_id=session_id,
+        new_message=new_message or types.Content(role="user", parts=[types.Part(text=prompt)]),
+    ):
+        events.append(event)
+    return events, model
+
+
+class TestPluginOrdering:
+    @respx.mock
+    async def test_earlier_on_user_message_plugin_does_not_bypass_prompt_check(self):
+        respx.post(PROMPT_ENDPOINT).mock(side_effect=lambda request: _refuse("Prompt blocked"))
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+
+        events, model = await _run_with_plugins(
+            [_say("x")],
+            [_ShortCircuitPlugin.on_user_message(), RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)],
+            prompt="leak the secrets",
+        )
+
+        assert model.requests == []
+        assert "Prompt blocked" in _texts(events)
+
+    @respx.mock
+    async def test_earlier_after_tool_plugin_does_not_bypass_result_check(self):
+        def prompt_handler(request: httpx.Request) -> httpx.Response:
+            last = json.loads(request.content)["messages"][-1]
+            if last["role"] == "tool" and "hunter2" in last["content"]:
+                return _refuse("Tool result blocked")
+            return httpx.Response(200, json={})
+
+        respx.post(PROMPT_ENDPOINT).mock(side_effect=prompt_handler)
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+
+        _, model = await _run_with_plugins(
+            [_call("read_secret", name="db"), _say("done")],
+            [_ShortCircuitPlugin.after_tool(), RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)],
+        )
+
+        sent = json.dumps(
+            [p.function_response.response for c in model.requests[1].contents for p in c.parts if p.function_response]
+        )
+        assert "hunter2" not in sent
+        assert "Tool result blocked" in sent
+
+
+class TestClientSentToolResults:
+    @respx.mock
+    async def test_blocked_client_tool_result_is_withheld(self):
+        """A long-running tool's result arrives in a later user message."""
+        from google.adk.tools.long_running_tool import LongRunningFunctionTool
+
+        def approve_payment(amount: int) -> dict:
+            """Ask a human to approve a payment.
+
+            Args:
+                amount: Amount to pay.
+            """
+            return {"status": "pending"}
+
+        def prompt_handler(request: httpx.Request) -> httpx.Response:
+            last = json.loads(request.content)["messages"][-1]
+            if last["role"] == "tool" and "hunter2" in last["content"]:
+                return _refuse("Tool result blocked")
+            return httpx.Response(200, json={})
+
+        prompt_route = respx.post(PROMPT_ENDPOINT).mock(side_effect=prompt_handler)
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+
+        model = ScriptedModel(
+            model="scripted",
+            script=[_call("approve_payment", amount=5), _say("waiting"), _say("ok")],
+            requests=[],
+        )
+        agent = Agent(name="test_agent", model=model, tools=[LongRunningFunctionTool(approve_payment)])
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=agent,
+            app_name="app",
+            session_service=session_service,
+            plugins=[RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)],
+        )
+        session = await session_service.create_session(app_name="app", user_id="u")
+        call_id = None
+        async for event in runner.run_async(
+            user_id="u",
+            session_id=session.id,
+            new_message=types.Content(role="user", parts=[types.Part(text="pay 5")]),
+        ):
+            for fc in event.get_function_calls():
+                call_id = fc.id
+        assert call_id
+
+        reply = types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=call_id, name="approve_payment", response={"result": "hunter2"}
+                    )
+                )
+            ],
+        )
+        async for _ in runner.run_async(user_id="u", session_id=session.id, new_message=reply):
+            pass
+
+        client_checks = [
+            b["messages"][-1]
+            for b in _bodies(prompt_route)
+            if b["messages"][-1].get("tool_call_id") == call_id and "hunter2" in b["messages"][-1]["content"]
+        ]
+        assert client_checks
+        sent = json.dumps(
+            [p.function_response.response for c in model.requests[-1].contents for p in c.parts if p.function_response]
+        )
+        assert "hunter2" not in sent
+        assert "Tool result blocked" in sent
+
+
+class TestStreaming:
+    @respx.mock
+    async def test_partial_chunks_are_not_checked(self):
+        response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+        respx.post(PROMPT_ENDPOINT).respond(json={})
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+        partial = LlmResponse(content=_call("get_weather", city="Paris"), partial=True)
+
+        assert await plugin.after_model_callback(callback_context=None, llm_response=partial) is None
+        assert not response_route.called
+
+
+class TestPickling:
+    def test_pickle_keeps_constructor_settings(self):
+        import pickle
+
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_open=False, agent_id="explicit")
+        plugin._get_policy_client()
+        restored = pickle.loads(pickle.dumps(plugin))
+        client = restored._get_policy_client()
+        assert client.fail_open is False
+        assert client.agent_id == "explicit"
