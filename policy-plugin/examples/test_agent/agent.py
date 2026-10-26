@@ -4,14 +4,8 @@ Has two tools:
   - get_weather: harmless, should be allowed
   - delete_file: destructive, should be blocked by policy
 
-Run locally:
-    RUBRIK_WEBHOOK_URL=https://your-webhook.example.com \
-    GOOGLE_API_KEY=your-gemini-key \
-    python -m examples.test_agent.agent
-
-Or with auto-instrumentation (no code changes):
-    RUBRIK_WEBHOOK_URL=https://your-webhook.example.com \
-    RUBRIK_AUTO_INSTRUMENT=true \
+Run locally (set RUBRIK_API_KEY from your secret store):
+    RUBRIK_WEBHOOK_URL=https://webhooks.example.com/<tenant>/<webhook>/ \
     GOOGLE_API_KEY=your-gemini-key \
     python -m examples.test_agent.agent
 """
@@ -55,7 +49,7 @@ def delete_file(path: str) -> dict:
 
 root_agent = Agent(
     name="policy_test_agent",
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     description="Test agent with harmless and destructive tools.",
     instruction=(
         "You are a test agent. When asked about weather, use get_weather. "
@@ -71,7 +65,6 @@ root_agent = Agent(
 async def main():
     session_service = InMemorySessionService()
 
-    # Explicit plugin usage — auto-instrumentation would also work
     runner = Runner(
         agent=root_agent,
         app_name="policy_test",
