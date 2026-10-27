@@ -86,14 +86,20 @@ The plugin checks four points in each ADK run. Each check sends the conversation
 
 Streamed chunks are not checked one by one; the response that ADK acts on is.
 
-ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list.
+ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list. This changes the order of the runner's other plugins: a plugin you placed first (for example, a response cache) runs after this one.
+
+The webhook accepts request bodies up to 15 MiB. When the conversation is larger, the plugin drops the oldest messages from the check, keeping the system prompt and the turn being evaluated, and logs a warning.
 
 Limitations:
 
 - When another plugin's `before_model_callback` returns a cached response, ADK skips `after_model_callback`. Tool calls in that response are still checked by `before_tool_callback`; its text is not checked.
+- With `StreamingMode.SSE`, ADK sends partial text to the caller before the final response is checked. A blocked response is replaced in the session and in the final event, but text already streamed to the user is not withdrawn. Tool calls are checked before they run in every mode.
 - In live (bidirectional streaming) mode, ADK does not call plugin tool callbacks or `on_user_message_callback`, so only `after_model_callback` runs.
+- Only text is checked in prompts. When a prompt is blocked, its images and files are dropped along with the text.
 
-If the webhook is unreachable, the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: prompts, tool calls, and tool results are then blocked while the webhook is unavailable.
+If a check fails (the webhook is unreachable, times out, or returns a malformed response), the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: prompts, tool calls, and tool results are then blocked while checks fail.
+
+Misconfiguration is not a check failure. Invalid constructor arguments raise when the plugin is created, and a missing `RUBRIK_WEBHOOK_URL` raises `RuntimeError` at the first callback.
 
 The webhook endpoints are the ones a LiteLLM proxy uses, so the credentials come from an Agent Cloud LiteLLM connection.
 
@@ -132,7 +138,8 @@ remote_app = agent_engines.create(
     agent_engine=app,
     display_name="my-agent",
     requirements=[
-        "google-cloud-aiplatform[agent-engines,adk]",
+        "google-cloud-aiplatform[agent-engines,adk]>=1.142.0",
+        # Match the version installed locally, which is what gets pickled.
         "rubrik-agent-cloud-policy-plugin[adk]==0.2.0",
     ],
     env_vars={
@@ -142,7 +149,7 @@ remote_app = agent_engines.create(
 )
 ```
 
-Agent Runtime sets `GOOGLE_CLOUD_AGENT_ENGINE_ID`, so the plugin identifies the agent without further configuration.
+Agent Runtime sets `GOOGLE_CLOUD_AGENT_ENGINE_ID` to the reasoning engine ID. That is the agent ID under which the Agent Cloud Vertex AI connection (including Gemini Enterprise agents) records the agent, so the plugin identifies the agent without further configuration. For an agent that the connection does not discover, set `RUBRIK_AGENT_ID`.
 
 **Important**: Do NOT set `GOOGLE_API_KEY` in `env_vars` — Agent Runtime uses Vertex AI service account auth. Setting an API key conflicts with the session service (`Project/location and API key are mutually exclusive`).
 

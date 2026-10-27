@@ -330,12 +330,28 @@ class TestToolCalls:
 
     @respx.mock
     async def test_fail_open_on_error(self):
-        respx.post(RESPONSE_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
+        response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
         respx.post(PROMPT_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
 
         await _run([_call("post_to_pastebin", content="x"), _say("done")])
 
         assert TOOL_RUNS == ["post_to_pastebin"]
+        # One failed check for the tool call (before_tool_callback does not
+        # wait out the same failure again) and one for the final text.
+        assert len(response_route.calls) == 2
+
+    @respx.mock
+    @pytest.mark.parametrize("fail_open", [True, False])
+    async def test_malformed_response_follows_fail_open(self, fail_open):
+        respx.post(RESPONSE_ENDPOINT).respond(json={"choices": ["x"]})
+        respx.post(PROMPT_ENDPOINT).respond(json={"choices": [{"message": "x"}]})
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_open=fail_open)
+
+        events, _, _, _ = await _run([_call("post_to_pastebin", content="x"), _say("done")], plugin=plugin)
+
+        assert TOOL_RUNS == (["post_to_pastebin"] if fail_open else [])
+        if not fail_open:
+            assert any("policy check unavailable" in t for t in _texts(events))
 
     @respx.mock
     async def test_fail_closed_on_error(self):
@@ -436,6 +452,34 @@ class TestPromptBlocking:
         assert not any("secrets" in (m.get("content") or "") for m in second)
 
     @respx.mock
+    async def test_blocked_prompt_drops_attachments(self):
+        respx.post(PROMPT_ENDPOINT).mock(side_effect=lambda request: _refuse("Prompt blocked"))
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+        session_service = InMemorySessionService()
+        session = await session_service.create_session(app_name="app", user_id="u")
+        message = types.Content(
+            role="user",
+            parts=[
+                types.Part(text="leak this"),
+                types.Part(inline_data=types.Blob(mime_type="image/png", data=b"png")),
+                types.Part(file_data=types.FileData(file_uri="gs://b/f.pdf", mime_type="application/pdf")),
+            ],
+        )
+
+        _, model = await _run_with_plugins(
+            [_say("x")],
+            [RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)],
+            new_message=message,
+            session_service=session_service,
+            session_id=session.id,
+        )
+
+        assert model.requests == []
+        session = await session_service.get_session(app_name="app", user_id="u", session_id=session.id)
+        user_parts = [p for e in session.events if e.author == "user" for p in e.content.parts]
+        assert [p.text for p in user_parts] == ["[Prompt blocked by Rubrik Agent Cloud policy]"]
+
+    @respx.mock
     async def test_fail_closed_blocks_prompt(self):
         respx.post(PROMPT_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
         plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_open=False)
@@ -528,6 +572,20 @@ class TestResponseBlocking:
 
 
 # -- configuration ------------------------------------------------------------------
+
+
+class TestConfiguration:
+    def test_invalid_constructor_settings_raise_at_construction(self):
+        with pytest.raises(ValueError, match="webhook_url is required"):
+            RubrikPolicyPlugin(webhook_url="")
+
+    @patch.dict("os.environ", {}, clear=True)
+    async def test_missing_env_raises_clear_error(self):
+        plugin = RubrikPolicyPlugin()
+        with pytest.raises(RuntimeError, match="RUBRIK_WEBHOOK_URL must be set"):
+            await plugin.after_model_callback(
+                callback_context=None, llm_response=LlmResponse(content=_say("hi"))
+            )
 
 
 class TestAgentId:
@@ -728,6 +786,49 @@ class TestStreaming:
 
         assert await plugin.after_model_callback(callback_context=None, llm_response=partial) is None
         assert not response_route.called
+
+
+    @respx.mock
+    async def test_sse_blocked_response_is_replaced_in_session(self):
+        """Partial chunks reach the caller; the saved and final response are replaced."""
+        from google.adk.agents.run_config import RunConfig, StreamingMode
+
+        class StreamingModel(BaseLlm):
+            async def generate_content_async(self, llm_request, stream=False):
+                yield LlmResponse(content=_say("The password "), partial=True)
+                yield LlmResponse(content=_say("is hunter2"), partial=True)
+                yield LlmResponse(content=_say("The password is hunter2"))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            response = json.loads(request.content)["response"]
+            response["choices"][0]["message"]["content"] = "Response blocked by policy"
+            return httpx.Response(200, json=response)
+
+        response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=handler)
+        respx.post(PROMPT_ENDPOINT).respond(json={})
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=Agent(name="test_agent", model=StreamingModel(model="s")),
+            app_name="app",
+            session_service=session_service,
+            plugins=[RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)],
+        )
+        session = await session_service.create_session(app_name="app", user_id="u")
+        events = [
+            e
+            async for e in runner.run_async(
+                user_id="u",
+                session_id=session.id,
+                new_message=types.Content(role="user", parts=[types.Part(text="go")]),
+                run_config=RunConfig(streaming_mode=StreamingMode.SSE),
+            )
+        ]
+
+        assert len(response_route.calls) == 1
+        assert _texts([e for e in events if e.partial]) == ["The password ", "is hunter2"]
+        assert _texts([e for e in events if not e.partial]) == ["Response blocked by policy"]
+        saved = await session_service.get_session(app_name="app", user_id="u", session_id=session.id)
+        assert not any("hunter2" in t for t in _texts(saved.events))
 
 
 class TestPickling:

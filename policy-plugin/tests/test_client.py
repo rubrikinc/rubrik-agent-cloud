@@ -14,6 +14,7 @@ from rubrik_agent_cloud_policy.client import (
     PolicyResult,
     RubrikPolicyClient,
     ToolCall,
+    _fit_body,
     _parse_prompt_response,
     _parse_webhook_response,
     _to_openai_payload,
@@ -219,6 +220,21 @@ class TestParseWebhookResponse:
         assert [tc.name for tc in result.blocked] == ["send_email"]
         assert result.explanation == "Response blocked by policy"
 
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"choices": ["x"]},
+            {"choices": "x"},
+            {"choices": [{"message": "x"}]},
+            {"choices": [{"message": {"content": 1}}]},
+            {"choices": [{"message": {"tool_calls": "x"}}]},
+            {"choices": [{"message": {"tool_calls": ["x"]}}]},
+        ],
+    )
+    def test_malformed_raises_value_error(self, response):
+        with pytest.raises(ValueError):
+            _parse_webhook_response(response, [ToolCall(name="a", arguments="{}", id="c1")], "hi")
+
     def test_text_unchanged_is_not_blocked(self):
         response = {"choices": [{"message": {"content": "Hello"}}]}
         result = _parse_webhook_response(response, [], sent_text="Hello")
@@ -236,6 +252,19 @@ class TestParsePromptResponse:
 
     def test_refusal_without_content(self):
         assert _parse_prompt_response({"choices": [{"message": {}}]})
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"choices": ["x"]},
+            {"choices": "x"},
+            {"choices": [{"message": "x"}]},
+            {"choices": [{"message": {"content": ["x"]}}]},
+        ],
+    )
+    def test_malformed_raises_value_error(self, response):
+        with pytest.raises(ValueError):
+            _parse_prompt_response(response)
 
 
 # -- Client integration (mocked HTTP) -----------------------------------------
@@ -307,7 +336,23 @@ class TestClientEvaluateToolCalls:
             assert body["request"]["messages"] == [{"role": "user", "content": "read the secret"}]
             assert body["request"]["tools"][0]["function"]["name"] == "read_secret"
             assert body["request"]["metadata"] == {"rac_agent_id": "engine-1"}
-            assert body["response"]["id"] == "inv-1"
+            assert body["response"]["id"].startswith("inv-1-")
+        finally:
+            await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_response_id_is_unique_per_check(self):
+        """The webhook keys forensic records by the response id."""
+        route = respx.post(ENDPOINT).respond(json={"choices": [{"message": {}}]})
+        client = RubrikPolicyClient(webhook_url=WEBHOOK_URL)
+        context = PolicyContext(correlation_id="inv-1")
+        try:
+            await client.evaluate_tool_calls([], context)
+            await client.evaluate_tool_calls([], context)
+            ids = [json.loads(c.request.content)["response"]["id"] for c in route.calls]
+            assert ids[0] != ids[1]
+            assert all(i.startswith("inv-1-") for i in ids)
         finally:
             await client.close()
 
@@ -336,6 +381,87 @@ class TestClientEvaluateToolCalls:
                 client.evaluate_tool_calls([ToolCall(name="foo", arguments="{}", id="c1")])
             )
             assert result.blocked == ()
+
+    @respx.mock
+    def test_one_client_per_live_loop(self):
+        """Clients of closed loops are dropped; concurrent loops get their own."""
+        import asyncio
+        import threading
+
+        respx.post(ENDPOINT).respond(
+            json={"choices": [{"message": {"tool_calls": [{"id": "c1"}]}}]}
+        )
+        client = RubrikPolicyClient(webhook_url=WEBHOOK_URL)
+        calls = [ToolCall(name="foo", arguments="{}", id="c1")]
+        for _ in range(3):
+            asyncio.run(client.evaluate_tool_calls(calls))
+        assert len(client._clients) == 1
+
+        both_running = threading.Barrier(2)
+        seen: list[int] = []
+
+        async def overlap():
+            await client.evaluate_tool_calls(calls)
+            both_running.wait(timeout=5)
+            # Both loops are open here, each with its own client.
+            seen.append(len(client._clients))
+
+        threads = [threading.Thread(target=asyncio.run, args=(overlap(),)) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert seen == [2, 2]
+
+
+class TestFitBody:
+    def test_small_body_unchanged(self):
+        request = {"messages": [{"role": "user", "content": "hi"}]}
+        assert _fit_body(lambda r: r, request, 1_000) == request
+
+    def test_drops_oldest_messages_keeping_system_and_last(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            *({"role": "user", "content": "x" * 100} for _ in range(10)),
+            {"role": "user", "content": "latest"},
+        ]
+        body = _fit_body(lambda r: r, {"messages": messages}, 500)
+        kept = body["messages"]
+        assert len(json.dumps(body)) <= 500
+        assert kept[0] == messages[0]
+        assert kept[-1] == messages[-1]
+        assert len(kept) < len(messages)
+
+    def test_does_not_start_with_orphaned_tool_result(self):
+        messages = [
+            {"role": "user", "content": "x" * 200},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "y" * 50},
+            {"role": "user", "content": "latest"},
+        ]
+        body = _fit_body(lambda r: r, {"messages": messages}, 300)
+        assert body["messages"][0]["role"] != "tool"
+        assert body["messages"][-1] == messages[-1]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_client_trims_to_body_limit(self):
+        route = respx.post(PROMPT_ENDPOINT).respond(json={})
+        client = RubrikPolicyClient(webhook_url=WEBHOOK_URL)
+        client._MAX_BODY_BYTES = 2_000
+        context = PolicyContext(
+            messages=(
+                *({"role": "user", "content": "x" * 500} for _ in range(10)),
+                {"role": "user", "content": "latest"},
+            ),
+        )
+        try:
+            await client.evaluate_prompt(context)
+            sent = route.calls[0].request.content
+            assert len(sent) <= 2_000
+            assert json.loads(sent)["messages"][-1]["content"] == "latest"
+        finally:
+            await client.close()
 
 
 class TestClientEvaluatePrompt:

@@ -8,12 +8,14 @@ model responses, prompts, and tool results against policies.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import threading
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -52,8 +54,10 @@ class PolicyContext:
     ``messages`` is the conversation in OpenAI chat format, ending with the
     turn being evaluated. ``tools`` lists the agent's declared tools in OpenAI
     format. ``agent_id`` identifies the agent to Agent Cloud so that policies
-    scoped to specific agents apply. ``correlation_id`` groups the forensic
-    records of one model request.
+    scoped to specific agents apply. ``correlation_id`` groups the checks of
+    one agent run (the ADK invocation ID): ``before_prompt`` sends it as
+    ``correlation_key``, and ``after_completion`` uses it as the prefix of
+    the response ``id``, which is unique per check.
     """
 
     messages: tuple[dict[str, Any], ...] = ()
@@ -80,6 +84,9 @@ class RubrikPolicyClient:
 
     _CONNECT_TIMEOUT = 2.0
     _TOTAL_TIMEOUT = 5.0
+    # The webhook rejects request bodies over 15 MiB with 413. Older messages
+    # are dropped to stay under this, with headroom for the response and tools.
+    _MAX_BODY_BYTES = 12 * 1024 * 1024
 
     def __init__(
         self,
@@ -104,8 +111,8 @@ class RubrikPolicyClient:
         if api_key:
             self._headers["Authorization"] = f"Bearer {api_key}"
 
-        self._client: Optional[httpx.AsyncClient] = None
-        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
+        self._clients_lock = threading.Lock()
         log.info(
             "RubrikPolicyClient enabled (webhook=%s, fail_open=%s, agent_id=%s)",
             self._webhook_url,
@@ -166,10 +173,12 @@ class RubrikPolicyClient:
         fail-open vs. fail-closed behavior.
         """
         context = context or PolicyContext()
-        envelope = {
-            "request": _to_openai_request(context, self.agent_id),
-            "response": _to_openai_payload(tool_calls, text, context.correlation_id),
-        }
+        response = _to_openai_payload(tool_calls, text, _response_id(context.correlation_id))
+        envelope = _fit_body(
+            lambda request: {"request": request, "response": response},
+            _to_openai_request(context, self.agent_id),
+            self._MAX_BODY_BYTES,
+        )
         data = await self._post(self._tool_blocking_endpoint, envelope)
         return _parse_webhook_response(data, tool_calls, text)
 
@@ -192,17 +201,16 @@ class RubrikPolicyClient:
         body = _to_openai_request(context, self.agent_id)
         if context.correlation_id:
             body["correlation_key"] = context.correlation_id
+        body = _fit_body(lambda request: request, body, self._MAX_BODY_BYTES)
         data = await self._post(self._prompt_endpoint, body)
         return _parse_prompt_response(data)
 
     async def close(self) -> None:
-        if self._client:
-            client, self._client = self._client, None
-            try:
-                await client.aclose()
-            except RuntimeError:
-                # The client belongs to an event loop that is already closed.
-                pass
+        """Close the HTTP client of the running event loop."""
+        with self._clients_lock:
+            client = self._clients.pop(asyncio.get_running_loop(), None)
+        if client is not None:
+            await client.aclose()
 
     # -- internals ------------------------------------------------------------
 
@@ -216,16 +224,21 @@ class RubrikPolicyClient:
 
     def _get_client(self) -> httpx.AsyncClient:
         # An httpx.AsyncClient is bound to the event loop it first ran on.
-        # ADK's synchronous Runner.run (used by AdkApp.stream_query) starts a
-        # new event loop for every call, so recreate the client per loop.
+        # ADK's synchronous Runner.run (used by AdkApp.stream_query) runs each
+        # call on a new event loop in its own thread, and calls can overlap,
+        # so keep one client per loop. Clients of closed loops can no longer
+        # be closed with aclose(); dropping them releases their connections.
         loop = asyncio.get_running_loop()
-        if self._client is None or self._client_loop is not loop:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self._TOTAL_TIMEOUT, connect=self._CONNECT_TIMEOUT),
-                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
-            )
-            self._client_loop = loop
-        return self._client
+        with self._clients_lock:
+            client = self._clients.get(loop)
+            if client is None:
+                for stale in [l for l in self._clients if l.is_closed()]:
+                    del self._clients[stale]
+                client = self._clients[loop] = httpx.AsyncClient(
+                    timeout=httpx.Timeout(self._TOTAL_TIMEOUT, connect=self._CONNECT_TIMEOUT),
+                    limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                )
+        return client
 
 
 # -- format translation (module-level, stateless) ----------------------------
@@ -243,6 +256,54 @@ def _to_openai_request(context: PolicyContext, default_agent_id: str = "") -> di
     if agent_id:
         request["metadata"] = {"rac_agent_id": agent_id}
     return request
+
+
+def _response_id(correlation_id: str) -> str:
+    """A response ``id`` unique per check, prefixed by the correlation ID.
+
+    The webhook keys the forensic records of a check by this ``id``, so
+    checks of different model responses in one run must not share it.
+    """
+    suffix = uuid.uuid4().hex[:12]
+    return f"{correlation_id}-{suffix}" if correlation_id else f"rubrik-policy-{suffix}"
+
+
+def _fit_body(
+    build: Callable[[dict[str, Any]], dict[str, Any]],
+    request: dict[str, Any],
+    max_bytes: int,
+) -> dict[str, Any]:
+    """Drop the oldest conversation messages until the body fits ``max_bytes``.
+
+    ``build`` maps the OpenAI request to the full body. Leading system
+    messages and the last message (the turn being evaluated) are kept, and
+    tool results are not left without the assistant turn that called them.
+    """
+    body = build(request)
+    size = _json_size(body)
+    if size <= max_bytes:
+        return body
+
+    messages = request["messages"]
+    head = 0
+    while head < len(messages) - 1 and messages[head].get("role") in ("system", "developer"):
+        head += 1
+    sizes = [_json_size(m) + 2 for m in messages]  # +2 for the ", " separator
+    start = head
+    while start < len(messages) - 1 and size > max_bytes:
+        size -= sizes[start]
+        start += 1
+    while start < len(messages) - 1 and messages[start].get("role") == "tool":
+        start += 1
+    log.warning(
+        "Conversation exceeds the webhook body limit; dropped the %d oldest messages",
+        start - head,
+    )
+    return build({**request, "messages": messages[:head] + messages[start:]})
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, default=str).encode())
 
 
 def _to_openai_payload(
@@ -288,14 +349,18 @@ def _parse_webhook_response(
     It signals a blocked tool call by appending an explanation to the
     content, separated from any original text by a blank line. It signals a
     blocked response by replacing the content entirely.
-    """
-    choices = response.get("choices", [])
-    if not choices:
-        raise ValueError("Webhook returned empty choices")
 
-    message = choices[0].get("message") or {}
+    Raises ``ValueError`` if the response does not have that shape.
+    """
+    message = _first_message(response)
+    if message is None:
+        raise ValueError("Webhook returned empty choices")
+    content = _content(message)
     returned_tool_calls = message.get("tool_calls") or []
-    content = message.get("content") or ""
+    if not isinstance(returned_tool_calls, list) or not all(
+        isinstance(tc, dict) for tc in returned_tool_calls
+    ):
+        raise ValueError("Webhook returned malformed tool_calls")
 
     appended = bool(sent_text) and content.startswith(f"{sent_text}\n\n")
     if sent_text and content != sent_text and not appended:
@@ -308,7 +373,9 @@ def _parse_webhook_response(
 
     # Counter, not set: if a returned id matches two originals, only as many
     # originals as were returned count as allowed.
-    remaining = Counter(tc["id"] for tc in returned_tool_calls if tc.get("id"))
+    remaining = Counter(
+        tc["id"] for tc in returned_tool_calls if isinstance(tc.get("id"), str)
+    )
     allowed: list[ToolCall] = []
     blocked: list[ToolCall] = []
     for tc in original_tool_calls:
@@ -329,9 +396,30 @@ def _parse_prompt_response(response: dict[str, Any]) -> Optional[str]:
 
     The webhook returns ``{}`` to let the message through, or a synthetic
     chat completion whose ``choices[0].message.content`` is the refusal.
+
+    Raises ``ValueError`` if the response does not have that shape.
     """
+    message = _first_message(response)
+    if message is None:
+        return None
+    return _content(message) or "Message blocked by Rubrik Agent Cloud policy."
+
+
+def _first_message(response: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """``choices[0].message``, or ``None`` when there are no choices."""
     choices = response.get("choices")
     if not choices:
         return None
+    if not isinstance(choices, list) or not isinstance(choices[0], dict):
+        raise ValueError("Webhook returned malformed choices")
     message = choices[0].get("message") or {}
-    return message.get("content") or "Message blocked by Rubrik Agent Cloud policy."
+    if not isinstance(message, dict):
+        raise ValueError("Webhook returned a malformed message")
+    return message
+
+
+def _content(message: dict[str, Any]) -> str:
+    content = message.get("content") or ""
+    if not isinstance(content, str):
+        raise ValueError("Webhook returned non-string content")
+    return content

@@ -14,6 +14,7 @@ Usage:
 import argparse
 import logging
 import os
+from importlib.metadata import version
 
 import vertexai
 from vertexai import agent_engines
@@ -52,9 +53,13 @@ def deploy(project: str, location: str, bucket: str, api_key_secret: str) -> str
         "RUBRIK_WEBHOOK_URL": webhook_url,
         "RUBRIK_API_KEY": {"secret": api_key_secret, "version": "latest"},
     }
+    # Pin the plugin to the version installed here, which is what was
+    # pickled. Agent Runtime installs it from PyPI, so local changes must be
+    # released before they can be deployed.
+    plugin_version = version("rubrik-agent-cloud-policy-plugin")
     requirements = [
-        "google-cloud-aiplatform[agent-engines,adk]",
-        "rubrik-agent-cloud-policy-plugin[adk]==0.2.0",
+        "google-cloud-aiplatform[agent-engines,adk]>=1.142.0",
+        f"rubrik-agent-cloud-policy-plugin[adk]=={plugin_version}",
     ]
 
     remote_app = agent_engines.create(

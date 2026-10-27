@@ -15,9 +15,7 @@ import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional
-
-import httpx
+from typing import Any, Iterable, Optional
 
 try:
     from google.adk.plugins.base_plugin import BasePlugin
@@ -36,15 +34,6 @@ from rubrik_agent_cloud_policy.client import (
 )
 
 log = logging.getLogger(__name__)
-
-_WEBHOOK_ERRORS = (
-    httpx.HTTPError,
-    httpx.StreamError,
-    httpx.InvalidURL,
-    ValueError,
-    KeyError,
-    TypeError,
-)
 
 _CHECK_UNAVAILABLE = "policy check unavailable"
 _REDACTED_PROMPT = "[Prompt blocked by Rubrik Agent Cloud policy]"
@@ -102,10 +91,16 @@ class RubrikPolicyPlugin(BasePlugin):
     start of each run the plugin moves itself to the front of the runner's
     plugin list.
 
-    Construction defers client initialization until first use so the plugin
-    can be created locally (for cloudpickle) without ``RUBRIK_WEBHOOK_URL``.
-    Pickling drops the client, so the unpickled plugin builds it again from
-    its constructor arguments, or from the environment if there are none.
+    Any failure of a check, including a malformed webhook response, follows
+    ``fail_open``.  Misconfiguration raises instead: constructor arguments
+    are validated at construction, and without them a missing
+    ``RUBRIK_WEBHOOK_URL`` raises ``RuntimeError`` at the first callback.
+
+    Without constructor arguments, the client is built on first use so the
+    plugin can be created locally (for cloudpickle) without
+    ``RUBRIK_WEBHOOK_URL``.  Pickling drops the client, so the unpickled
+    plugin builds it again from its constructor arguments, or from the
+    environment if there are none.
     """
 
     PLUGIN_NAME = "rubrik_agent_cloud_policy"
@@ -113,10 +108,12 @@ class RubrikPolicyPlugin(BasePlugin):
     def __init__(self, name: str = PLUGIN_NAME, **kwargs: Any) -> None:
         super().__init__(name=name)
         self._kwargs = kwargs
-        # Defer client creation — may not have env vars at pickle time.
-        # _get_policy_client() initializes on first callback invocation.
         self._policy_client: Optional[RubrikPolicyClient] = None
         self._invocations: dict[str, _InvocationState] = {}
+        if kwargs:
+            # Validate explicit settings now. Without them, defer: the
+            # environment may lack RUBRIK_WEBHOOK_URL at pickle time.
+            self._get_policy_client()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -154,8 +151,9 @@ class RubrikPolicyPlugin(BasePlugin):
         """Check a new user message before ADK saves it to the session.
 
         Checks each tool result in the message and then its text.  Blocked
-        tool results are replaced with the refusal; blocked text is replaced
-        with a placeholder and the refusal is held for ``before_run_callback``.
+        tool results are replaced with the refusal.  When the text is
+        blocked, every part except tool results is replaced with a
+        placeholder, and the refusal is held for ``before_run_callback``.
         """
         self._move_to_front(invocation_context)
         state = self._state(invocation_context)
@@ -201,7 +199,9 @@ class RubrikPolicyPlugin(BasePlugin):
                 log.info("[%s] Blocked user prompt", self.PLUGIN_NAME)
                 state.prompt_refusal = refusal
                 changed = True
-                new_parts = [p for p in new_parts if not p.text]
+                # Drop the text and any media or files that came with it;
+                # keep the (already checked) tool results.
+                new_parts = [p for p in new_parts if p.function_response is not None]
                 new_parts.append(types.Part(text=_REDACTED_PROMPT))
 
         if not changed:
@@ -265,16 +265,19 @@ class RubrikPolicyPlugin(BasePlugin):
         if not fc_parts and not text:
             return None
 
+        client = self._get_policy_client()
+        tool_calls: list[ToolCall] = []
         try:
-            client = self._get_policy_client()
             tool_calls, index_by_id = _gemini_parts_to_tool_calls(fc_parts)
             context = self._model_context(callback_context)
             result = await client.evaluate_response(tool_calls, text, context)
-        except _WEBHOOK_ERRORS:
-            log.exception(
-                "[%s] Webhook call failed in after_model_callback", self.PLUGIN_NAME
-            )
-            return _handle_error(llm_response, self._get_policy_client().fail_open)
+        except Exception:
+            log.exception("[%s] Policy check failed in after_model_callback", self.PLUGIN_NAME)
+            if client.fail_open:
+                # Failing open allowed these calls; don't make
+                # before_tool_callback wait out the same failure again.
+                self._approve(callback_context, tool_calls)
+            return _handle_error(llm_response, client.fail_open)
 
         if result.response_blocked:
             log.info("[%s] Blocked model response", self.PLUGIN_NAME)
@@ -284,9 +287,7 @@ class RubrikPolicyPlugin(BasePlugin):
             )
             return llm_response
 
-        approved = self._state(callback_context).approved_calls
-        for tc in result.allowed:
-            approved[_call_signature(tc.name, tc.arguments)] += 1
+        self._approve(callback_context, result.allowed)
 
         if not result.blocked:
             return None
@@ -315,16 +316,14 @@ class RubrikPolicyPlugin(BasePlugin):
             approved[signature] -= 1
             return None
 
+        client = self._get_policy_client()
         try:
-            client = self._get_policy_client()
             tc = ToolCall(name=tool.name, arguments=arguments)
             context = self._session_context(tool_context)
             result = await client.evaluate_tool_calls([tc], context)
-        except _WEBHOOK_ERRORS:
-            log.exception(
-                "[%s] Webhook call failed in before_tool_callback", self.PLUGIN_NAME
-            )
-            if self._get_policy_client().fail_open:
+        except Exception:
+            log.exception("[%s] Policy check failed in before_tool_callback", self.PLUGIN_NAME)
+            if client.fail_open:
                 return None
             self._mark_blocked(tool_context)
             return {"error": f"Tool execution blocked: {_CHECK_UNAVAILABLE}"}
@@ -350,17 +349,15 @@ class RubrikPolicyPlugin(BasePlugin):
             # before_tool_callback returned; there is no tool output to check.
             return None
 
+        client = self._get_policy_client()
         try:
-            client = self._get_policy_client()
             context = self._session_context(
                 tool_context, tail=[_tool_result_message(tool.name, call_id, result)]
             )
             refusal = await client.evaluate_prompt(context)
-        except _WEBHOOK_ERRORS:
-            log.exception(
-                "[%s] Webhook call failed in after_tool_callback", self.PLUGIN_NAME
-            )
-            if self._get_policy_client().fail_open:
+        except Exception:
+            log.exception("[%s] Policy check failed in after_tool_callback", self.PLUGIN_NAME)
+            if client.fail_open:
                 return None
             return {"error": f"Tool result withheld: {_CHECK_UNAVAILABLE}"}
 
@@ -384,15 +381,15 @@ class RubrikPolicyPlugin(BasePlugin):
     ) -> Optional[str]:
         """Check the last of ``tail`` (after the session) with before_prompt.
 
-        Returns the refusal, or ``None`` when allowed.  On a webhook error
+        Returns the refusal, or ``None`` when allowed.  When the check fails
         returns ``None`` when failing open, else an unavailability refusal.
         """
+        client = self._get_policy_client()
         try:
-            client = self._get_policy_client()
             return await client.evaluate_prompt(_session_context(invocation_context, tail))
-        except _WEBHOOK_ERRORS:
-            log.exception("[%s] Webhook call failed checking a message", self.PLUGIN_NAME)
-            if self._get_policy_client().fail_open:
+        except Exception:
+            log.exception("[%s] Policy check failed for a message", self.PLUGIN_NAME)
+            if client.fail_open:
                 return None
             return f"{unavailable_prefix}: {_CHECK_UNAVAILABLE}"
 
@@ -419,6 +416,12 @@ class RubrikPolicyPlugin(BasePlugin):
         return replace(
             context, messages=tuple(messages), tools=request.tools, model=request.model
         )
+
+    def _approve(self, ctx: Any, tool_calls: Iterable[ToolCall]) -> None:
+        """Let ``before_tool_callback`` skip these calls."""
+        approved = self._state(ctx).approved_calls
+        for tc in tool_calls:
+            approved[_call_signature(tc.name, tc.arguments)] += 1
 
     def _mark_blocked(self, tool_context: Any) -> None:
         call_id = getattr(tool_context, "function_call_id", None)
@@ -475,9 +478,9 @@ def _apply_policy_result(
 
 
 def _handle_error(llm_response: Any, fail_open: bool) -> Any:
-    """Handle webhook errors: fail-open passes through, fail-closed strips all tools."""
+    """Handle a failed check: fail-open passes through, fail-closed strips all tools."""
     if fail_open:
-        log.warning("Webhook unreachable — failing open, response allowed")
+        log.warning("Policy check failed — failing open, response allowed")
         return None
 
     new_parts = [
