@@ -86,7 +86,7 @@ The plugin checks four points in each ADK run. Each check sends the conversation
 
 Streamed chunks are not checked one by one; the response that ADK acts on is.
 
-ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list. This changes the order of the runner's other plugins: a plugin you placed first (for example, a response cache) runs after this one.
+ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list, so a plugin you placed first (for example, a response cache) runs after this one. This plugin's callbacks return a value only to block, so the other plugins still run unless something is blocked.
 
 The webhook accepts request bodies up to 15 MiB. When the conversation is larger, the plugin drops the oldest messages from the check, keeping the system prompt and the turn being evaluated, and logs a warning.
 
