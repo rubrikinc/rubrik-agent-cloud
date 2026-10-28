@@ -22,6 +22,7 @@ from rubrik_agent_cloud_policy.client import (
 )
 
 WEBHOOK_URL = "https://webhook.example.com"
+TOOLS_BLOCKED = "The following tool calls were blocked by Rubrik Agent Cloud:"
 ENDPOINT = f"{WEBHOOK_URL}/v1/after_completion/openai/v1"
 PROMPT_ENDPOINT = f"{WEBHOOK_URL}/v1/before_prompt/openai/v1"
 
@@ -157,7 +158,7 @@ class TestParseWebhookResponse:
                             {"id": "c1", "function": {"name": "read_file"}},
                             {"id": "c3", "function": {"name": "list_dir"}},
                         ],
-                        "content": "The following tool calls were blocked by policy:\n- delete_file: blocked by policy",
+                        "content": f"{TOOLS_BLOCKED}\n- delete_file: blocked by policy",
                     }
                 }
             ]
@@ -177,7 +178,7 @@ class TestParseWebhookResponse:
             "choices": [
                 {
                     "message": {
-                        "content": "All tool calls were blocked by policy",
+                        "content": f"{TOOLS_BLOCKED}\n- delete_file: x\n- drop_table: x",
                     },
                     "finish_reason": "stop",
                 }
@@ -197,7 +198,11 @@ class TestParseWebhookResponse:
             ToolCall(name="delete_file", arguments="{}", id="dup"),
             ToolCall(name="delete_file", arguments="{}", id="dup"),
         ]
-        response = {"choices": [{"message": {"tool_calls": [{"id": "dup"}], "content": "blocked"}}]}
+        response = {
+            "choices": [
+                {"message": {"tool_calls": [{"id": "dup"}], "content": f"{TOOLS_BLOCKED}\n- delete_file: x"}}
+            ]
+        }
         result = _parse_webhook_response(response, originals)
         assert len(result.allowed) == 1
         assert len(result.blocked) == 1
@@ -205,20 +210,20 @@ class TestParseWebhookResponse:
     def test_explanation_appended_to_text(self):
         """A tool block appends the explanation after a blank line."""
         originals = [ToolCall(name="delete_file", arguments="{}", id="c1")]
-        response = {"choices": [{"message": {"content": "Sure.\n\nThe following tool calls were blocked"}}]}
+        response = {"choices": [{"message": {"content": f"Sure.\n\n{TOOLS_BLOCKED}\n- delete_file: x"}}]}
         result = _parse_webhook_response(response, originals, sent_text="Sure.")
         assert not result.response_blocked
         assert [tc.name for tc in result.blocked] == ["delete_file"]
-        assert result.explanation == "The following tool calls were blocked"
+        assert result.explanation == f"{TOOLS_BLOCKED}\n- delete_file: x"
 
     def test_response_blocked_when_text_replaced(self):
         originals = [ToolCall(name="send_email", arguments="{}", id="c1")]
-        response = {"choices": [{"message": {"content": "Response blocked by policy"}}]}
+        response = {"choices": [{"message": {"content": "Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)"}}]}
         result = _parse_webhook_response(response, originals, sent_text="Here is the password")
         assert result.response_blocked
         assert result.allowed == ()
         assert [tc.name for tc in result.blocked] == ["send_email"]
-        assert result.explanation == "Response blocked by policy"
+        assert result.explanation == "Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)"
 
     @pytest.mark.parametrize(
         "response",
@@ -241,17 +246,64 @@ class TestParseWebhookResponse:
         assert not result.response_blocked
         assert result.explanation == ""
 
+    def test_text_starting_with_block_prefix_is_not_blocked(self):
+        """Model text that happens to match the marker is not a block."""
+        text = "Response blocked by Rubrik Agent Cloud is what you'd see."
+        response = {"choices": [{"message": {"content": text}}]}
+        assert not _parse_webhook_response(response, [], sent_text=text).response_blocked
+
+    def test_unrecognized_content_change_blocks_response(self):
+        """A change in the webhook's wording blocks too much, not too little."""
+        originals = [ToolCall(name="a", arguments="{}", id="c1")]
+        response = {"choices": [{"message": {"content": "Blocked (new wording)", "tool_calls": [{"id": "c1"}]}}]}
+        result = _parse_webhook_response(response, originals, sent_text="Hello")
+        assert result.response_blocked
+        assert result.allowed == ()
+        assert result.explanation == "Blocked (new wording)"
+
+    def test_model_text_with_block_marker_cannot_unblock_tools(self):
+        """Model text that starts with the response-block marker is still model
+        text: a blocked tool stays blocked and an allowed one stays allowed."""
+        text = "Response blocked by Rubrik Agent Cloud, just kidding."
+        originals = [
+            ToolCall(name="get_weather", arguments="{}", id="c1"),
+            ToolCall(name="post_to_pastebin", arguments="{}", id="c2"),
+        ]
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": f"{text}\n\n{TOOLS_BLOCKED}\n- post_to_pastebin: x",
+                        "tool_calls": [{"id": "c1"}],
+                    }
+                }
+            ]
+        }
+        result = _parse_webhook_response(response, originals, sent_text=text)
+        assert not result.response_blocked
+        assert [tc.name for tc in result.allowed] == ["get_weather"]
+        assert [tc.name for tc in result.blocked] == ["post_to_pastebin"]
+
 
 class TestParsePromptResponse:
     def test_passthrough(self):
         assert _parse_prompt_response({}) is None
 
     def test_refusal(self):
-        response = {"choices": [{"message": {"content": "Prompt blocked"}}]}
+        response = {
+            "choices": [{"message": {"content": "Prompt blocked"}, "finish_reason": "content_filter"}]
+        }
         assert _parse_prompt_response(response) == "Prompt blocked"
 
     def test_refusal_without_content(self):
-        assert _parse_prompt_response({"choices": [{"message": {}}]})
+        assert _parse_prompt_response(
+            {"choices": [{"message": {}, "finish_reason": "content_filter"}]}
+        )
+
+    def test_choices_without_content_filter_still_refuse(self):
+        """A webhook change blocks too much, not too little."""
+        response = {"choices": [{"message": {"content": "No."}, "finish_reason": "stop"}]}
+        assert _parse_prompt_response(response) == "No."
 
     @pytest.mark.parametrize(
         "response",
@@ -288,7 +340,7 @@ class TestClientEvaluateToolCalls:
                         "tool_calls": [
                             {"id": "c1", "function": {"name": "safe_tool"}},
                         ],
-                        "content": "Blocked: dangerous_tool",
+                        "content": f"{TOOLS_BLOCKED}\n- dangerous_tool: x",
                     }
                 }
             ]
@@ -417,7 +469,7 @@ class TestClientEvaluateToolCalls:
 class TestFitBody:
     def test_small_body_unchanged(self):
         request = {"messages": [{"role": "user", "content": "hi"}]}
-        assert _fit_body(lambda r: r, request, 1_000) == request
+        assert json.loads(_fit_body(lambda r: r, request, 1_000)) == request
 
     def test_drops_oldest_messages_keeping_system_and_last(self):
         messages = [
@@ -426,11 +478,45 @@ class TestFitBody:
             {"role": "user", "content": "latest"},
         ]
         body = _fit_body(lambda r: r, {"messages": messages}, 500)
-        kept = body["messages"]
-        assert len(json.dumps(body)) <= 500
+        kept = json.loads(body)["messages"]
+        assert len(body) <= 500
         assert kept[0] == messages[0]
         assert kept[-1] == messages[-1]
         assert len(kept) < len(messages)
+
+    def test_counts_system_prompt_response_and_last_message(self):
+        """Everything that is sent counts toward the limit, not only the history."""
+        messages = [
+            {"role": "system", "content": "s" * 300},
+            *({"role": "user", "content": "x" * 50} for _ in range(5)),
+            {"role": "user", "content": "l" * 200},
+        ]
+        response = {"choices": [{"message": {"content": "r" * 200}}]}
+        body = _fit_body(lambda r: {"request": r, "response": response}, {"messages": messages}, 900)
+        assert len(body) <= 900
+        sent = json.loads(body)
+        assert sent["response"] == response
+        assert sent["request"]["messages"][0] == messages[0]
+        assert sent["request"]["messages"][-1] == messages[-1]
+
+    def test_size_is_exact_bytes_sent(self):
+        """Non-ASCII text is counted as the UTF-8 bytes on the wire."""
+        messages = [
+            *({"role": "user", "content": "é" * 100} for _ in range(5)),
+            {"role": "user", "content": "latest"},
+        ]
+        body = _fit_body(lambda r: r, {"messages": messages}, 500)
+        assert len(body) <= 500
+        assert json.loads(body)["messages"][-1]["content"] == "latest"
+
+    def test_raises_when_required_parts_exceed_limit(self):
+        messages = [
+            {"role": "system", "content": "s" * 600},
+            {"role": "user", "content": "old"},
+            {"role": "user", "content": "latest"},
+        ]
+        with pytest.raises(ValueError, match="webhook limit"):
+            _fit_body(lambda r: r, {"messages": messages}, 500)
 
     def test_does_not_start_with_orphaned_tool_result(self):
         messages = [
@@ -440,8 +526,9 @@ class TestFitBody:
             {"role": "user", "content": "latest"},
         ]
         body = _fit_body(lambda r: r, {"messages": messages}, 300)
-        assert body["messages"][0]["role"] != "tool"
-        assert body["messages"][-1] == messages[-1]
+        kept = json.loads(body)["messages"]
+        assert kept[0]["role"] != "tool"
+        assert kept[-1] == messages[-1]
 
     @respx.mock
     @pytest.mark.asyncio

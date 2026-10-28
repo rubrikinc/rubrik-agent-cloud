@@ -65,6 +65,11 @@ def auto_instrument() -> bool:
             pm = getattr(self, "plugin_manager", None)
             if pm and hasattr(pm, "register_plugin"):
                 pm.register_plugin(plugin)
+                # First, so that no other plugin's callback can hide activity
+                # from it (ADK stops at the first plugin that returns a value).
+                if isinstance(getattr(pm, "plugins", None), list):
+                    pm.plugins.remove(plugin)
+                    pm.plugins.insert(0, plugin)
                 log.info("Auto-injected RubrikPolicyPlugin into Runner")
             else:
                 log.warning(

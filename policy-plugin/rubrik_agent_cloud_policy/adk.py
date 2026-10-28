@@ -11,13 +11,16 @@ Requires the ``adk`` extra::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections import Counter
+import os
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
 try:
+    from google.adk.flows.llm_flows.functions import generate_client_function_call_id
     from google.adk.plugins.base_plugin import BasePlugin
     from google.genai import types
 except ImportError as exc:
@@ -39,7 +42,8 @@ _CHECK_UNAVAILABLE = "policy check unavailable"
 _REDACTED_PROMPT = "[Prompt blocked by Rubrik Agent Cloud policy]"
 
 # Bounds the per-invocation bookkeeping if after_run_callback never runs for
-# some invocations (for example, when a run raises).
+# some invocations (for example, when a run raises), and the record of
+# prompts blocked after ADK saved them.
 _MAX_TRACKED_INVOCATIONS = 256
 
 
@@ -49,8 +53,9 @@ class _InvocationState:
 
     # Latest model request per agent, used as the context of later checks.
     requests: dict[str, PolicyContext] = field(default_factory=dict)
-    # Signatures of tool calls that after_model_callback already allowed.
-    approved_calls: Counter = field(default_factory=Counter)
+    # Function call IDs that after_model_callback allowed or failed open on.
+    # IDs are unique per call, so an approval never covers a later call.
+    approved_call_ids: set = field(default_factory=set)
     # Function call IDs of tools that before_tool_callback blocked.
     blocked_call_ids: set = field(default_factory=set)
     # Refusal for a blocked user prompt, returned by before_run_callback.
@@ -87,9 +92,14 @@ class RubrikPolicyPlugin(BasePlugin):
       sees it.  A blocked result is replaced with the refusal.
 
     ADK stops calling plugins for a callback once one returns a value, so a
-    plugin earlier in the list could hide activity from this one.  At the
-    start of each run the plugin moves itself to the front of the runner's
-    plugin list.
+    plugin earlier in the list could hide activity from this one.  The
+    plugin moves itself to the front of the runner's plugin list at the
+    start and end of each run, and ``auto_instrument`` registers it first.
+    If a plugin listed before it in ``plugins=[...]`` returns a value from
+    ``on_user_message_callback`` on a runner's first run, ADK saves the
+    prompt before this plugin checks it; ``before_run_callback`` then checks
+    it and ends the run, and ``before_model_callback`` removes it from later
+    model requests in this process.
 
     Any failure of a check, including a malformed webhook response, follows
     ``fail_open``.  Misconfiguration raises instead: constructor arguments
@@ -98,38 +108,60 @@ class RubrikPolicyPlugin(BasePlugin):
 
     Without constructor arguments, the client is built on first use so the
     plugin can be created locally (for cloudpickle) without
-    ``RUBRIK_WEBHOOK_URL``.  Pickling drops the client, so the unpickled
-    plugin builds it again from its constructor arguments, or from the
-    environment if there are none.
+    ``RUBRIK_WEBHOOK_URL``.  Pickling (and deep copying, which
+    ``AdkApp.clone`` does before deploying) drops the client and the
+    ``api_key`` argument; the restored plugin reads the key from
+    ``RUBRIK_API_KEY``.
+
+    Callbacks may run concurrently on different threads (``Runner.run``
+    runs each call on its own thread), so the per-invocation bookkeeping is
+    guarded by a lock.
     """
 
     PLUGIN_NAME = "rubrik_agent_cloud_policy"
 
     def __init__(self, name: str = PLUGIN_NAME, **kwargs: Any) -> None:
         super().__init__(name=name)
+        # Kept apart from the other settings so that pickling drops it.
+        self._api_key: Optional[str] = kwargs.pop("api_key", None)
         self._kwargs = kwargs
         self._policy_client: Optional[RubrikPolicyClient] = None
+        self._lock = threading.Lock()
         self._invocations: dict[str, _InvocationState] = {}
-        if kwargs:
+        # Invocation IDs whose prompt was blocked after ADK saved it.
+        self._redacted_invocations: dict[str, None] = {}
+        if kwargs or self._api_key:
             # Validate explicit settings now. Without them, defer: the
             # environment may lack RUBRIK_WEBHOOK_URL at pickle time.
             self._get_policy_client()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
-        state["_policy_client"] = None
-        state["_invocations"] = {}
+        state.update(
+            _api_key=None,
+            _policy_client=None,
+            _lock=None,
+            _invocations={},
+            _redacted_invocations={},
+        )
         return state
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def _get_policy_client(self) -> RubrikPolicyClient:
-        if self._policy_client is None:
-            if self._kwargs:
-                self._policy_client = RubrikPolicyClient(**self._kwargs)
-            else:
-                self._policy_client = RubrikPolicyClient.from_env()
-        return self._policy_client
+        with self._lock:
+            if self._policy_client is None:
+                if self._kwargs or self._api_key:
+                    api_key = self._api_key or os.getenv(RubrikPolicyClient._API_KEY_ENV)
+                    self._policy_client = RubrikPolicyClient(api_key=api_key, **self._kwargs)
+                else:
+                    self._policy_client = RubrikPolicyClient.from_env()
+            return self._policy_client
 
     def _state(self, ctx: Any) -> _InvocationState:
+        """The invocation's bookkeeping, created if needed.  Hold ``_lock``."""
         key = _invocation_id(ctx)
         state = self._invocations.get(key)
         if state is None:
@@ -156,48 +188,25 @@ class RubrikPolicyPlugin(BasePlugin):
         placeholder, and the refusal is held for ``before_run_callback``.
         """
         self._move_to_front(invocation_context)
-        state = self._state(invocation_context)
-        state.message_checked = True
+        with self._lock:
+            self._state(invocation_context).message_checked = True
         parts = list(getattr(user_message, "parts", None) or [])
         if not parts:
             return None
 
-        changed = False
-        new_parts = []
-        tool_messages: list[dict[str, Any]] = []
-        for part in parts:
-            fr = part.function_response
-            if fr is None:
-                new_parts.append(part)
-                continue
-            message = _tool_result_message(fr.name or "", fr.id or "", fr.response)
-            refusal = await self._check_tail(
-                invocation_context, [*tool_messages, message], "Tool result withheld"
-            )
-            tool_messages.append(message)
-            if refusal is None:
-                new_parts.append(part)
-                continue
-            log.info("[%s] Blocked tool result: %s", self.PLUGIN_NAME, fr.name)
-            changed = True
-            new_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        id=fr.id, name=fr.name, response={"error": refusal}
-                    )
-                )
-            )
+        session = _session_context(invocation_context)
+        new_parts, tool_messages = await self._check_tool_results(session, parts)
+        changed = new_parts != parts
 
-        text = "\n".join(p.text for p in parts if p.text and not getattr(p, "thought", None))
+        text = _parts_text(parts)
         if text:
             refusal = await self._check_tail(
-                invocation_context,
-                [*tool_messages, {"role": "user", "content": text}],
-                "Request blocked",
+                session, [*tool_messages, {"role": "user", "content": text}], "Request blocked"
             )
             if refusal is not None:
                 log.info("[%s] Blocked user prompt", self.PLUGIN_NAME)
-                state.prompt_refusal = refusal
+                with self._lock:
+                    self._state(invocation_context).prompt_refusal = refusal
                 changed = True
                 # Drop the text and any media or files that came with it;
                 # keep the (already checked) tool results.
@@ -211,32 +220,55 @@ class RubrikPolicyPlugin(BasePlugin):
     async def before_run_callback(self, *, invocation_context: Any) -> Any:
         """End the run with the refusal when the user prompt was blocked.
 
-        If an earlier plugin's ``on_user_message_callback`` returned a value,
-        this plugin's was skipped; the prompt is then checked here, after
-        ADK saved it but before the model is called.
+        If a plugin listed earlier returned a value from
+        ``on_user_message_callback``, this plugin's was skipped and ADK
+        saved the prompt unchecked.  The prompt is then checked here, before
+        the model is called; if it is blocked, the run ends and
+        ``before_model_callback`` keeps it out of later model requests.
         """
         self._move_to_front(invocation_context)
-        state = self._state(invocation_context)
-        refusal, state.prompt_refusal = state.prompt_refusal, None
-        if refusal is None and not state.message_checked:
+        with self._lock:
+            state = self._state(invocation_context)
+            refusal, state.prompt_refusal = state.prompt_refusal, None
+            fallback = refusal is None and not state.message_checked
             state.message_checked = True
-            if _is_user_prompt(getattr(invocation_context, "user_content", None)):
-                refusal = await self._check_tail(invocation_context, [], "Request blocked")
+        if fallback and _is_user_prompt(getattr(invocation_context, "user_content", None)):
+            refusal = await self._check_tail(
+                _session_context(invocation_context), [], "Request blocked"
+            )
+            if refusal is not None:
+                log.warning(
+                    "[%s] Blocked a user prompt that ADK already saved, because a "
+                    "plugin listed before this one handled on_user_message_callback",
+                    self.PLUGIN_NAME,
+                )
+                with self._lock:
+                    redacted = self._redacted_invocations
+                    redacted[_invocation_id(invocation_context)] = None
+                    while len(redacted) > _MAX_TRACKED_INVOCATIONS:
+                        redacted.pop(next(iter(redacted)))
         if refusal is None:
             return None
         return types.Content(role="model", parts=[types.Part(text=refusal)])
 
     async def after_run_callback(self, *, invocation_context: Any) -> None:
-        self._invocations.pop(_invocation_id(invocation_context), None)
+        self._move_to_front(invocation_context)
+        with self._lock:
+            self._invocations.pop(_invocation_id(invocation_context), None)
 
     async def before_model_callback(
         self, *, callback_context: Any, llm_request: Any
     ) -> Any:
-        """Record the model request as context for the response check."""
+        """Record the model request as context for the response check.
+
+        Also removes prompts that ``before_run_callback`` blocked after ADK
+        saved them.
+        """
         try:
-            self._state(callback_context).requests[_agent_name(callback_context)] = (
-                _request_context(llm_request, callback_context)
-            )
+            self._redact_saved_prompts(callback_context, llm_request)
+            context = _request_context(llm_request, callback_context)
+            with self._lock:
+                self._state(callback_context).requests[_agent_name(callback_context)] = context
         except Exception:  # context is best effort; never fail the model call
             log.debug("[%s] Could not record model request", self.PLUGIN_NAME, exc_info=True)
         return None
@@ -273,11 +305,13 @@ class RubrikPolicyPlugin(BasePlugin):
             result = await client.evaluate_response(tool_calls, text, context)
         except Exception:
             log.exception("[%s] Policy check failed in after_model_callback", self.PLUGIN_NAME)
-            if client.fail_open:
-                # Failing open allowed these calls; don't make
-                # before_tool_callback wait out the same failure again.
-                self._approve(callback_context, tool_calls)
-            return _handle_error(llm_response, client.fail_open)
+            if not client.fail_open:
+                return _fail_closed_response(llm_response, bool(fc_parts))
+            # Failing open allowed these calls; don't make
+            # before_tool_callback wait out the same failure again.
+            log.warning("[%s] Failing open: response allowed", self.PLUGIN_NAME)
+            self._approve(callback_context, tool_calls)
+            return None
 
         if result.response_blocked:
             log.info("[%s] Blocked model response", self.PLUGIN_NAME)
@@ -309,16 +343,16 @@ class RubrikPolicyPlugin(BasePlugin):
         response, causing ADK to skip the entire ``after_model_callback``
         chain.
         """
-        arguments = json.dumps(tool_args or {}, default=str)
-        approved = self._state(tool_context).approved_calls
-        signature = _call_signature(tool.name, arguments)
-        if approved[signature] > 0:
-            approved[signature] -= 1
-            return None
+        call_id = getattr(tool_context, "function_call_id", None) or ""
+        with self._lock:
+            approved = self._state(tool_context).approved_call_ids
+            if call_id in approved:
+                approved.discard(call_id)
+                return None
 
         client = self._get_policy_client()
         try:
-            tc = ToolCall(name=tool.name, arguments=arguments)
+            tc = ToolCall(name=tool.name, arguments=json.dumps(tool_args or {}, default=str))
             context = self._session_context(tool_context)
             result = await client.evaluate_tool_calls([tc], context)
         except Exception:
@@ -343,24 +377,18 @@ class RubrikPolicyPlugin(BasePlugin):
     ) -> Optional[dict[str, str]]:
         """Check a tool result before the model sees it."""
         call_id = getattr(tool_context, "function_call_id", None) or ""
-        state = self._invocations.get(_invocation_id(tool_context))
-        if call_id and state is not None and call_id in state.blocked_call_ids:
-            # ADK runs after-tool callbacks on the refusal that
-            # before_tool_callback returned; there is no tool output to check.
-            return None
-
-        client = self._get_policy_client()
-        try:
-            context = self._session_context(
-                tool_context, tail=[_tool_result_message(tool.name, call_id, result)]
-            )
-            refusal = await client.evaluate_prompt(context)
-        except Exception:
-            log.exception("[%s] Policy check failed in after_tool_callback", self.PLUGIN_NAME)
-            if client.fail_open:
+        with self._lock:
+            state = self._invocations.get(_invocation_id(tool_context))
+            if call_id and state is not None and call_id in state.blocked_call_ids:
+                # ADK runs after-tool callbacks on the refusal that
+                # before_tool_callback returned; there is no tool output to check.
                 return None
-            return {"error": f"Tool result withheld: {_CHECK_UNAVAILABLE}"}
 
+        refusal = await self._check_tail(
+            self._session_context(tool_context),
+            [_tool_result_message(tool.name, call_id, result)],
+            "Tool result withheld",
+        )
         if refusal is None:
             return None
         log.info("[%s] Blocked tool result: %s", self.PLUGIN_NAME, tool.name)
@@ -372,41 +400,95 @@ class RubrikPolicyPlugin(BasePlugin):
         plugins = getattr(
             getattr(invocation_context, "plugin_manager", None), "plugins", None
         )
-        if isinstance(plugins, list) and plugins and plugins[0] is not self and self in plugins:
-            plugins.remove(self)
-            plugins.insert(0, self)
+        if not isinstance(plugins, list):
+            return
+        with self._lock:
+            if plugins and plugins[0] is not self and self in plugins:
+                plugins.remove(self)
+                plugins.insert(0, self)
+
+    async def _check_tool_results(
+        self, session: PolicyContext, parts: list[Any]
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        """Check the tool results in ``parts`` concurrently.
+
+        Each result is checked after the session and the results before it.
+        Returns ``parts`` with blocked results replaced by the refusal, and
+        the tool messages of all results.
+        """
+        indexed = [(i, p.function_response) for i, p in enumerate(parts) if p.function_response]
+        tool_messages = [
+            _tool_result_message(fr.name or "", fr.id or "", fr.response) for _, fr in indexed
+        ]
+        refusals = await asyncio.gather(
+            *(
+                self._check_tail(session, tool_messages[: n + 1], "Tool result withheld")
+                for n in range(len(tool_messages))
+            )
+        )
+        new_parts = list(parts)
+        for (i, fr), refusal in zip(indexed, refusals):
+            if refusal is None:
+                continue
+            log.info("[%s] Blocked tool result: %s", self.PLUGIN_NAME, fr.name)
+            new_parts[i] = types.Part(
+                function_response=types.FunctionResponse(
+                    id=fr.id, name=fr.name, response={"error": refusal}
+                )
+            )
+        return new_parts, tool_messages
 
     async def _check_tail(
-        self, invocation_context: Any, tail: list[dict[str, Any]], unavailable_prefix: str
+        self, session: PolicyContext, tail: list[dict[str, Any]], unavailable_prefix: str
     ) -> Optional[str]:
-        """Check the last of ``tail`` (after the session) with before_prompt.
+        """Check the last of ``tail``, after ``session``, with before_prompt.
 
         Returns the refusal, or ``None`` when allowed.  When the check fails
         returns ``None`` when failing open, else an unavailability refusal.
         """
         client = self._get_policy_client()
         try:
-            return await client.evaluate_prompt(_session_context(invocation_context, tail))
+            context = replace(session, messages=(*session.messages, *tail))
+            return await client.evaluate_prompt(context)
         except Exception:
             log.exception("[%s] Policy check failed for a message", self.PLUGIN_NAME)
             if client.fail_open:
                 return None
             return f"{unavailable_prefix}: {_CHECK_UNAVAILABLE}"
 
+    def _redact_saved_prompts(self, ctx: Any, llm_request: Any) -> None:
+        """Replace prompts that were blocked after ADK saved them."""
+        with self._lock:
+            redacted = set(self._redacted_invocations)
+        if not redacted:
+            return
+        inv = getattr(ctx, "_invocation_context", None) or ctx
+        blocked = [
+            event.content
+            for event in getattr(getattr(inv, "session", None), "events", None) or []
+            if getattr(event, "invocation_id", None) in redacted
+            and getattr(event, "author", None) == "user"
+            and event.content is not None
+        ]
+        contents = getattr(llm_request, "contents", None) or []
+        for i, content in enumerate(contents):
+            if any(_same_content(content, b) for b in blocked):
+                contents[i] = types.Content(role="user", parts=[types.Part(text=_REDACTED_PROMPT)])
+
     def _model_context(self, callback_context: Any) -> PolicyContext:
         """The recorded model request, or the session if none was recorded."""
-        state = self._invocations.get(_invocation_id(callback_context))
-        request = state.requests.get(_agent_name(callback_context)) if state else None
+        with self._lock:
+            state = self._invocations.get(_invocation_id(callback_context))
+            request = state.requests.get(_agent_name(callback_context)) if state else None
         return request or self._session_context(callback_context)
 
-    def _session_context(
-        self, ctx: Any, tail: Optional[list[dict[str, Any]]] = None
-    ) -> PolicyContext:
+    def _session_context(self, ctx: Any) -> PolicyContext:
         """Session history, with the system prompt and tools of the recorded
         model request when there is one."""
-        context = _session_context(ctx, tail)
-        state = self._invocations.get(_invocation_id(ctx))
-        request = state.requests.get(_agent_name(ctx)) if state else None
+        context = _session_context(ctx)
+        with self._lock:
+            state = self._invocations.get(_invocation_id(ctx))
+            request = state.requests.get(_agent_name(ctx)) if state else None
         if request is None:
             return context
         messages = list(context.messages)
@@ -418,15 +500,15 @@ class RubrikPolicyPlugin(BasePlugin):
         )
 
     def _approve(self, ctx: Any, tool_calls: Iterable[ToolCall]) -> None:
-        """Let ``before_tool_callback`` skip these calls."""
-        approved = self._state(ctx).approved_calls
-        for tc in tool_calls:
-            approved[_call_signature(tc.name, tc.arguments)] += 1
+        """Let ``before_tool_callback`` skip these calls of the current response."""
+        with self._lock:
+            self._state(ctx).approved_call_ids.update(tc.id for tc in tool_calls)
 
     def _mark_blocked(self, tool_context: Any) -> None:
         call_id = getattr(tool_context, "function_call_id", None)
         if call_id:
-            self._state(tool_context).blocked_call_ids.add(call_id)
+            with self._lock:
+                self._state(tool_context).blocked_call_ids.add(call_id)
 
 
 # -- Gemini <-> ToolCall helpers (module-level, stateless) ----------------------
@@ -437,6 +519,11 @@ def _gemini_parts_to_tool_calls(
 ) -> tuple[list[ToolCall], dict[str, int]]:
     """Convert indexed Gemini ``Part`` objects to framework-agnostic ToolCalls.
 
+    A function call without an ID, or with an ID repeated in the response,
+    gets one the way ADK assigns them, before ADK would; ADK keeps it, so
+    ``before_tool_callback`` sees the same ID in
+    ``tool_context.function_call_id``.
+
     Returns:
         A tuple of (tool_calls, index_by_id) where index_by_id maps each
         ToolCall.id to its original index in llm_response.content.parts.
@@ -444,10 +531,10 @@ def _gemini_parts_to_tool_calls(
     tool_calls = []
     index_by_id: dict[str, int] = {}
     for i, part in fc_parts:
-        tc = ToolCall(
-            name=part.function_call.name,
-            arguments=_json_args(part.function_call.args),
-        )
+        fc = part.function_call
+        if not fc.id or fc.id in index_by_id:
+            fc.id = generate_client_function_call_id()
+        tc = ToolCall(name=fc.name, arguments=_json_args(fc.args), id=fc.id)
         tool_calls.append(tc)
         index_by_id[tc.id] = i
     return tool_calls, index_by_id
@@ -477,30 +564,14 @@ def _apply_policy_result(
     return llm_response
 
 
-def _handle_error(llm_response: Any, fail_open: bool) -> Any:
-    """Handle a failed check: fail-open passes through, fail-closed strips all tools."""
-    if fail_open:
-        log.warning("Policy check failed — failing open, response allowed")
-        return None
-
-    new_parts = [
-        p for p in llm_response.content.parts if p.function_call is None
-    ]
-    new_parts.append(
-        types.Part(text=f"Tool execution suspended: {_CHECK_UNAVAILABLE}")
-    )
+def _fail_closed_response(llm_response: Any, had_tool_calls: bool) -> Any:
+    """Replace an unchecked response, text and tool calls, with a notice."""
+    subject = "Response and tool calls" if had_tool_calls else "Response"
     llm_response.content = types.Content(
-        role=llm_response.content.role, parts=new_parts
+        role=llm_response.content.role or "model",
+        parts=[types.Part(text=f"{subject} withheld: {_CHECK_UNAVAILABLE}")],
     )
     return llm_response
-
-
-def _call_signature(name: str, arguments: str) -> str:
-    try:
-        arguments = json.dumps(json.loads(arguments), sort_keys=True)
-    except (TypeError, ValueError):
-        pass
-    return f"{name}\x00{arguments}"
 
 
 # -- context building -----------------------------------------------------------
@@ -536,17 +607,13 @@ def _request_context(llm_request: Any, callback_context: Any) -> PolicyContext:
     )
 
 
-def _session_context(
-    ctx: Any, tail: Optional[list[dict[str, Any]]] = None
-) -> PolicyContext:
+def _session_context(ctx: Any) -> PolicyContext:
     """Build a PolicyContext from the session events of the current agent.
 
     ``ctx`` is an ADK InvocationContext, CallbackContext, or ToolContext.
-    ``tail`` is appended as the turn being evaluated.
     """
-    tail = tail or []
     if ctx is None:
-        return PolicyContext(messages=tuple(tail))
+        return PolicyContext()
 
     inv = getattr(ctx, "_invocation_context", None) or ctx
     messages: list[dict[str, Any]] = []
@@ -554,7 +621,6 @@ def _session_context(
     if isinstance(instruction, str) and instruction:
         messages.append({"role": "system", "content": instruction})
     messages.extend(_contents_to_messages(_session_contents(inv)))
-    messages.extend(tail)
     return PolicyContext(messages=tuple(messages), correlation_id=_invocation_id(ctx))
 
 
@@ -673,11 +739,22 @@ def _is_user_prompt(content: Any) -> bool:
 
 
 def _response_text(content: Any) -> str:
-    return "\n".join(
-        p.text
-        for p in content.parts
-        if p.text and not getattr(p, "thought", None)
-    )
+    return _parts_text(content.parts)
+
+
+def _parts_text(parts: list[Any]) -> str:
+    """The non-thought text of ``parts``."""
+    return "\n".join(p.text for p in parts if p.text and not getattr(p, "thought", None))
+
+
+def _same_content(a: Any, b: Any) -> bool:
+    """Whether two Contents have the same role and parts."""
+    try:
+        return a.role == b.role and [p.model_dump() for p in a.parts or []] == [
+            p.model_dump() for p in b.parts or []
+        ]
+    except AttributeError:
+        return False
 
 
 def _system_text(instruction: Any) -> str:

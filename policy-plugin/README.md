@@ -82,13 +82,17 @@ The plugin checks four points in each ADK run. Each check sends the conversation
 | `before_tool_callback` | A tool call that `after_model_callback` did not check | `/v1/after_completion/openai/v1` | The tool does not run; the model receives an error result. |
 | `after_tool_callback` | Tool result | `/v1/before_prompt/openai/v1` | The model receives an error result instead of the tool output. |
 
-`before_tool_callback` is a safety net for tool calls that skip `after_model_callback`, which happens when another plugin's `before_model_callback` returns a cached response. Tool calls that `after_model_callback` already allowed are not checked again.
+`before_tool_callback` is a safety net for tool calls that skip `after_model_callback`, which happens when another plugin's `before_model_callback` returns a cached response. A tool call that `after_model_callback` allowed, or let through when its check failed open, is not checked again. The approval is tied to that function call's ID, so it never covers a later call with the same arguments.
+
+The plugin reads verdicts from the webhook's explicit signals. On `before_prompt`, the webhook returns `{}` to allow, or a refusal with `finish_reason: "content_filter"`. On `after_completion`, the tool calls it returns are the ones allowed, matched by ID. Blocked tool calls are explained by appended text that starts with `The following tool calls were blocked by Rubrik Agent Cloud:`, and a blocked response's content is replaced with text that starts with `Response blocked by Rubrik Agent Cloud`. If the webhook's output changes in any other way, the plugin logs a warning and blocks: a refusal without `content_filter` still refuses, and any other change to the response text blocks the whole response.
 
 Streamed chunks are not checked one by one; the response that ADK acts on is.
 
-ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. At the start of each run the plugin moves itself to the front of the runner's plugin list, so a plugin you placed first (for example, a response cache) runs after this one. This plugin's callbacks return a value only to block, so the other plugins still run unless something is blocked.
+ADK stops calling plugins for a callback once one returns a value, so a plugin earlier in the list could hide activity from this one. **List `RubrikPolicyPlugin` first** in `plugins=[...]`; `auto_instrument` registers it first. The plugin also moves itself to the front of the runner's plugin list at the start and end of each run, so a plugin you placed first (for example, a response cache) runs after this one. This plugin's callbacks return a value only to block, so the other plugins still run unless something is blocked.
 
-The webhook accepts request bodies up to 15 MiB. When the conversation is larger, the plugin drops the oldest messages from the check, keeping the system prompt and the turn being evaluated, and logs a warning.
+If another plugin is listed first and returns a value from `on_user_message_callback`, then on the runner's first run ADK saves the user prompt before this plugin sees it. `before_run_callback` then checks the prompt and, if it is blocked, ends the run with the refusal before the model is called. The prompt stays in the saved session; `before_model_callback` replaces it with a placeholder in later model requests from the same process, but not after a restart or on another replica.
+
+The webhook accepts request bodies up to 15 MiB. The size counts the whole body: the system prompt, the tools, the conversation, and the response or message being checked. When the body is larger, the plugin drops the oldest messages, keeping the system prompt and the turn being evaluated, and logs a warning. If the body is still too large, the check fails and `RUBRIK_POLICY_FAIL_OPEN` applies.
 
 Limitations:
 
@@ -97,7 +101,7 @@ Limitations:
 - In live (bidirectional streaming) mode, ADK does not call plugin tool callbacks or `on_user_message_callback`, so only `after_model_callback` runs.
 - Only text is checked in prompts. When a prompt is blocked, its images and files are dropped along with the text.
 
-If a check fails (the webhook is unreachable, times out, or returns a malformed response), the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: prompts, tool calls, and tool results are then blocked while checks fail.
+If a check fails (the webhook is unreachable, times out, or returns a malformed response), the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: while checks fail, prompts, tool results, and model responses (text and tool calls) are replaced with a notice that the policy check is unavailable.
 
 Misconfiguration is not a check failure. Invalid constructor arguments raise when the plugin is created, and a missing `RUBRIK_WEBHOOK_URL` raises `RuntimeError` at the first callback.
 
@@ -155,7 +159,7 @@ Agent Runtime sets `GOOGLE_CLOUD_AGENT_ENGINE_ID` to the reasoning engine ID. Th
 
 ### cloudpickle note
 
-Agent Runtime serializes plugins locally with `cloudpickle` and deserializes on the remote container. `RubrikPolicyClient` implements `__reduce__` so env vars like `RUBRIK_WEBHOOK_URL` are re-read on the remote side — not baked in from the local environment.
+Agent Runtime serializes plugins locally with `cloudpickle` and deserializes on the remote container. `RubrikPolicyClient` implements `__reduce__` so env vars like `RUBRIK_WEBHOOK_URL` are re-read on the remote side — not baked in from the local environment. A `RubrikPolicyPlugin` pickles its other constructor arguments but never `api_key`; the deployed plugin reads the key from `RUBRIK_API_KEY`.
 
 ## Direct Client Usage (Framework-Agnostic)
 

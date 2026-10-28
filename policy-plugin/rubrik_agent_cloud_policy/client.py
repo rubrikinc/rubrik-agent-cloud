@@ -84,9 +84,8 @@ class RubrikPolicyClient:
 
     _CONNECT_TIMEOUT = 2.0
     _TOTAL_TIMEOUT = 5.0
-    # The webhook rejects request bodies over 15 MiB with 413. Older messages
-    # are dropped to stay under this, with headroom for the response and tools.
-    _MAX_BODY_BYTES = 12 * 1024 * 1024
+    # The webhook rejects request bodies over 15 MiB with 413.
+    _MAX_BODY_BYTES = 15 * 1024 * 1024
 
     def __init__(
         self,
@@ -174,12 +173,12 @@ class RubrikPolicyClient:
         """
         context = context or PolicyContext()
         response = _to_openai_payload(tool_calls, text, _response_id(context.correlation_id))
-        envelope = _fit_body(
+        body = _fit_body(
             lambda request: {"request": request, "response": response},
             _to_openai_request(context, self.agent_id),
             self._MAX_BODY_BYTES,
         )
-        data = await self._post(self._tool_blocking_endpoint, envelope)
+        data = await self._post(self._tool_blocking_endpoint, body)
         return _parse_webhook_response(data, tool_calls, text)
 
     async def evaluate_tool_calls(
@@ -198,10 +197,10 @@ class RubrikPolicyClient:
         Returns the refusal text when the message is blocked, else ``None``.
         Raises on HTTP or parsing errors.
         """
-        body = _to_openai_request(context, self.agent_id)
+        request = _to_openai_request(context, self.agent_id)
         if context.correlation_id:
-            body["correlation_key"] = context.correlation_id
-        body = _fit_body(lambda request: request, body, self._MAX_BODY_BYTES)
+            request["correlation_key"] = context.correlation_id
+        body = _fit_body(lambda r: r, request, self._MAX_BODY_BYTES)
         data = await self._post(self._prompt_endpoint, body)
         return _parse_prompt_response(data)
 
@@ -214,8 +213,8 @@ class RubrikPolicyClient:
 
     # -- internals ------------------------------------------------------------
 
-    async def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        resp = await self._get_client().post(endpoint, json=payload, headers=self._headers)
+    async def _post(self, endpoint: str, body: bytes) -> dict[str, Any]:
+        resp = await self._get_client().post(endpoint, content=body, headers=self._headers)
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -272,38 +271,52 @@ def _fit_body(
     build: Callable[[dict[str, Any]], dict[str, Any]],
     request: dict[str, Any],
     max_bytes: int,
-) -> dict[str, Any]:
-    """Drop the oldest conversation messages until the body fits ``max_bytes``.
+) -> bytes:
+    """Serialize the body, dropping the oldest messages to fit ``max_bytes``.
 
-    ``build`` maps the OpenAI request to the full body. Leading system
-    messages and the last message (the turn being evaluated) are kept, and
-    tool results are not left without the assistant turn that called them.
+    ``build`` maps the OpenAI request to the full body, so the size counts
+    everything sent: the system prompt, the tools, the response under
+    evaluation, and the last message.  Leading system messages and the last
+    message (the turn being evaluated) are always kept, and a tool result is
+    not kept without the assistant turn that called it.  Raises
+    ``ValueError`` if the body does not fit even with every other message
+    dropped.
     """
-    body = build(request)
-    size = _json_size(body)
-    if size <= max_bytes:
+    body = _encode(build(request))
+    if len(body) <= max_bytes:
         return body
 
     messages = request["messages"]
     head = 0
     while head < len(messages) - 1 and messages[head].get("role") in ("system", "developer"):
         head += 1
-    sizes = [_json_size(m) + 2 for m in messages]  # +2 for the ", " separator
+    # Each dropped message removes its bytes and one "," separator.
+    over = len(body) - max_bytes
     start = head
-    while start < len(messages) - 1 and size > max_bytes:
-        size -= sizes[start]
+    while start < len(messages) - 1 and over > 0:
+        over -= len(_encode(messages[start])) + 1
         start += 1
     while start < len(messages) - 1 and messages[start].get("role") == "tool":
         start += 1
+
+    body = _encode(build({**request, "messages": messages[:head] + messages[start:]}))
+    if len(body) > max_bytes:
+        raise ValueError(
+            f"Policy check body is {len(body)} bytes with only the system prompt, "
+            f"tools, and the turn being evaluated; the webhook limit is {max_bytes}"
+        )
     log.warning(
         "Conversation exceeds the webhook body limit; dropped the %d oldest messages",
         start - head,
     )
-    return build({**request, "messages": messages[:head] + messages[start:]})
+    return body
 
 
-def _json_size(value: Any) -> int:
-    return len(json.dumps(value, default=str).encode())
+def _encode(value: Any) -> bytes:
+    """Serialize as JSON, compactly, as the request body."""
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False, default=str
+    ).encode()
 
 
 def _to_openai_payload(
@@ -337,6 +350,13 @@ def _to_openai_payload(
     }
 
 
+# Fixed prefixes of the webhook's block explanations (predibase
+# policy.RubrikDecisionReason and buildExplanationMessage).  A Reference ID and,
+# for verbose requests, the policy's reasoning may follow.
+_RESPONSE_BLOCKED = "Response blocked by Rubrik Agent Cloud"
+_TOOLS_BLOCKED = "The following tool calls were blocked by Rubrik Agent Cloud:"
+
+
 def _parse_webhook_response(
     response: dict[str, Any],
     original_tool_calls: list[ToolCall],
@@ -345,10 +365,15 @@ def _parse_webhook_response(
     """Parse the after_completion response to determine what was blocked.
 
     The webhook returns the *allowed* tool calls in
-    ``choices[0].message.tool_calls``, matched to the originals by ``id``.
-    It signals a blocked tool call by appending an explanation to the
-    content, separated from any original text by a blank line. It signals a
-    blocked response by replacing the content entirely.
+    ``choices[0].message.tool_calls``, matched to the originals by ``id``;
+    an original that is not returned was blocked.  It explains blocked tool
+    calls by appending an explanation that starts with ``The following tool
+    calls were blocked by Rubrik Agent Cloud:``, after the original text and
+    a blank line.  It blocks the whole response by replacing the content
+    with an explanation that starts with ``Response blocked by Rubrik Agent
+    Cloud``.  Any other change to the content is also treated as a blocked
+    response, so that a change in the webhook's wording blocks too much
+    rather than too little.
 
     Raises ``ValueError`` if the response does not have that shape.
     """
@@ -361,15 +386,6 @@ def _parse_webhook_response(
         isinstance(tc, dict) for tc in returned_tool_calls
     ):
         raise ValueError("Webhook returned malformed tool_calls")
-
-    appended = bool(sent_text) and content.startswith(f"{sent_text}\n\n")
-    if sent_text and content != sent_text and not appended:
-        return PolicyResult(
-            allowed=(),
-            blocked=tuple(original_tool_calls),
-            explanation=content or "Response blocked by Rubrik Agent Cloud policy.",
-            response_blocked=True,
-        )
 
     # Counter, not set: if a returned id matches two originals, only as many
     # originals as were returned count as allowed.
@@ -385,9 +401,27 @@ def _parse_webhook_response(
         else:
             blocked.append(tc)
 
-    explanation = ""
-    if blocked:
-        explanation = content[len(sent_text):].lstrip("\n") if appended else content
+    # The appended-explanation form is checked first: model text that
+    # happens to start with the response-block marker is still model text.
+    prefix = f"{sent_text}\n\n" if sent_text else ""
+    if content == sent_text:
+        explanation = ""
+    elif content.startswith(prefix) and content[len(prefix):].startswith(_TOOLS_BLOCKED):
+        explanation = content[len(prefix):]
+    else:
+        if not content.startswith(_RESPONSE_BLOCKED):
+            log.warning(
+                "Webhook changed the response without a recognized explanation; "
+                "treating the response as blocked"
+            )
+        return PolicyResult(
+            allowed=(),
+            blocked=tuple(original_tool_calls),
+            explanation=content or "Response blocked by Rubrik Agent Cloud policy.",
+            response_blocked=True,
+        )
+    if blocked and not explanation:
+        explanation = "Tool calls blocked by Rubrik Agent Cloud policy."
     return PolicyResult(allowed=tuple(allowed), blocked=tuple(blocked), explanation=explanation)
 
 
@@ -395,13 +429,19 @@ def _parse_prompt_response(response: dict[str, Any]) -> Optional[str]:
     """Parse the before_prompt response.
 
     The webhook returns ``{}`` to let the message through, or a synthetic
-    chat completion whose ``choices[0].message.content`` is the refusal.
+    chat completion with ``finish_reason`` ``content_filter`` (OpenAI's
+    moderation signal) whose ``choices[0].message.content`` is the refusal.
+    A response with choices but another ``finish_reason`` is still treated
+    as a refusal, so that a webhook change blocks too much rather than too
+    little.
 
     Raises ``ValueError`` if the response does not have that shape.
     """
     message = _first_message(response)
     if message is None:
         return None
+    if response["choices"][0].get("finish_reason") != "content_filter":
+        log.warning("Webhook returned a refusal without finish_reason content_filter")
     return _content(message) or "Message blocked by Rubrik Agent Cloud policy."
 
 

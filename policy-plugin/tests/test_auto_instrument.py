@@ -63,6 +63,25 @@ class TestAutoInstrument:
         ]
         assert "rubrik_agent_cloud_policy" in plugin_names
 
+    @patch.dict("os.environ", {"RUBRIK_WEBHOOK_URL": "https://webhook.test.com"})
+    def test_injected_plugin_is_first(self):
+        from google.adk.plugins.base_plugin import BasePlugin
+        from google.adk.runners import Runner
+
+        from rubrik_agent_cloud_policy.adk import RubrikPolicyPlugin
+
+        auto_mod.auto_instrument()
+        mock_agent = MagicMock()
+        mock_agent.name = "test_agent"
+        runner = Runner(
+            agent=mock_agent,
+            app_name="test_app",
+            session_service=MagicMock(),
+            plugins=[BasePlugin(name="cache")],
+        )
+
+        assert isinstance(runner.plugin_manager.plugins[0], RubrikPolicyPlugin)
+
     def test_no_injection_when_url_not_set(self):
         """Plugin is not injected when RUBRIK_WEBHOOK_URL is not set."""
         auto_mod.auto_instrument()

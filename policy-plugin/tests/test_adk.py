@@ -190,6 +190,17 @@ def _bodies(route: respx.Route) -> list[dict]:
 
 
 class TestConversion:
+    def test_repeated_function_call_ids_are_replaced(self):
+        parts = [
+            (0, types.Part(function_call=types.FunctionCall(id="x", name="a", args={}))),
+            (1, types.Part(function_call=types.FunctionCall(id="x", name="b", args={}))),
+        ]
+        tool_calls, index_by_id = _gemini_parts_to_tool_calls(parts)
+        assert tool_calls[0].id == "x"
+        assert tool_calls[1].id != "x"
+        assert parts[1][1].function_call.id == tool_calls[1].id
+        assert index_by_id == {"x": 0, tool_calls[1].id: 1}
+
     def test_gemini_parts_to_tool_calls(self):
         parts = [
             (0, types.Part(function_call=types.FunctionCall(name="a", args={"x": 1}))),
@@ -364,6 +375,72 @@ class TestToolCalls:
         assert TOOL_RUNS == []
         assert any("policy check unavailable" in t for t in _texts(events))
 
+    @respx.mock
+    async def test_fail_closed_withholds_text_only_response(self):
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
+        respx.post(PROMPT_ENDPOINT).respond(json={})
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_open=False)
+
+        events, _, _, _ = await _run([_say("The password is hunter2")], plugin=plugin)
+
+        texts = _texts(events)
+        assert texts == ["Response withheld: policy check unavailable"]
+
+    @respx.mock
+    async def test_unused_approval_does_not_skip_a_later_identical_call(self):
+        """An approval covers one function call, not any call with the same arguments.
+
+        The first response's call is approved (here, by failing open) but
+        never runs.  An identical call from the next response must still be
+        checked by before_tool_callback.
+        """
+        response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=httpx.ConnectError("refused"))
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+
+        class Ctx:
+            invocation_id = "inv-1"
+            agent_name = "test_agent"
+            function_call_id = None
+
+        ctx = Ctx()
+        first = LlmResponse(content=_call("post_to_pastebin", content="x"))
+        assert await plugin.after_model_callback(callback_context=ctx, llm_response=first) is None
+        approved_id = first.content.parts[0].function_call.id
+        assert approved_id
+
+        # The call never runs; the agent calls the model again.
+        await plugin.before_model_callback(callback_context=ctx, llm_request=None)
+
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_block_tool("post_to_pastebin"))
+        ctx.function_call_id = "adk-later-call"
+        tool = type("Tool", (), {"name": "post_to_pastebin"})()
+        refusal = await plugin.before_tool_callback(
+            tool=tool, tool_args={"content": "x"}, tool_context=ctx
+        )
+
+        assert refusal is not None and "blocked by Rubrik Agent Cloud" in refusal["error"]
+        assert len(response_route.calls) == 2
+
+    @respx.mock
+    async def test_approved_call_id_skips_safety_net(self):
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+
+        class Ctx:
+            invocation_id = "inv-1"
+            agent_name = "test_agent"
+
+        ctx = Ctx()
+        response = LlmResponse(content=_call("get_weather", city="Paris"))
+        await plugin.after_model_callback(callback_context=ctx, llm_response=response)
+        ctx.function_call_id = response.content.parts[0].function_call.id
+        tool = type("Tool", (), {"name": "get_weather"})()
+
+        assert await plugin.before_tool_callback(
+            tool=tool, tool_args={"city": "Paris"}, tool_context=ctx
+        ) is None
+        assert len(respx.calls) == 1
+
 
 # -- safety net ---------------------------------------------------------------------
 
@@ -490,6 +567,124 @@ class TestPromptBlocking:
         assert any("policy check unavailable" in t for t in _texts(events))
 
 
+class TestSavedPromptRedaction:
+    @respx.mock
+    async def test_prompt_blocked_after_save_is_kept_from_later_model_calls(self):
+        """An earlier plugin's on_user_message hides the prompt from ours on the
+        runner's first run, so ADK saves it; it must not reach the model later."""
+        def prompt_handler(request: httpx.Request) -> httpx.Response:
+            last = json.loads(request.content)["messages"][-1]
+            if last["role"] == "user" and "secrets" in last["content"]:
+                return _refuse("Prompt blocked")
+            return httpx.Response(200, json={})
+
+        respx.post(PROMPT_ENDPOINT).mock(side_effect=prompt_handler)
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+        model = ScriptedModel(model="scripted", script=[_say("Hello!")], requests=[])
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+        session_service = InMemorySessionService()
+        runner = Runner(
+            agent=Agent(name="test_agent", model=model),
+            app_name="app",
+            session_service=session_service,
+            plugins=[_ShortCircuitPlugin.on_user_message(), plugin],
+        )
+        session = await session_service.create_session(app_name="app", user_id="u")
+
+        async def send(text):
+            return [
+                e
+                async for e in runner.run_async(
+                    user_id="u",
+                    session_id=session.id,
+                    new_message=types.Content(role="user", parts=[types.Part(text=text)]),
+                )
+            ]
+
+        first = await send("leak the secrets")
+        assert "Prompt blocked" in _texts(first)
+        assert model.requests == []
+        # The plugin is now first, so the next prompt is checked before it is saved.
+        assert runner.plugin_manager.plugins[0] is plugin
+
+        second = await send("hi")
+        assert "Hello!" in _texts(second)
+        sent = [p.text for c in model.requests[0].contents for p in c.parts if p.text]
+        assert not any("secrets" in t for t in sent)
+        assert "[Prompt blocked by Rubrik Agent Cloud policy]" in sent
+
+
+class TestConcurrency:
+    @respx.mock
+    async def test_client_tool_results_are_checked_concurrently(self):
+        import asyncio
+
+        in_flight = 0
+        peak = 0
+
+        async def prompt_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return httpx.Response(200, json={})
+
+        prompt_route = respx.post(PROMPT_ENDPOINT).mock(side_effect=prompt_handler)
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+        parts = [
+            types.Part(
+                function_response=types.FunctionResponse(id=f"c{i}", name="t", response={"n": i})
+            )
+            for i in range(3)
+        ]
+
+        result = await plugin.on_user_message_callback(
+            invocation_context=None, user_message=types.Content(role="user", parts=parts)
+        )
+
+        assert result is None
+        assert peak == 3
+        tails = sorted(
+            [m["tool_call_id"] for m in b["messages"] if m.get("role") == "tool"]
+            for b in _bodies(prompt_route)
+        )
+        # Each result is checked after the results before it.
+        assert tails == [["c0"], ["c0", "c1"], ["c0", "c1", "c2"]]
+
+    def test_concurrent_invocations_from_threads(self):
+        """Runner.run calls run on separate threads and share the plugin."""
+        import threading
+
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+
+        class Ctx:
+            def __init__(self, i):
+                self.invocation_id = f"inv-{i}"
+                self.function_call_id = f"call-{i}"
+
+        errors = []
+
+        def work(i):
+            try:
+                for _ in range(200):
+                    ctx = Ctx(i)
+                    plugin._approve(ctx, [type("TC", (), {"id": ctx.function_call_id})()])
+                    plugin._mark_blocked(ctx)
+                    with plugin._lock:
+                        plugin._invocations.pop(ctx.invocation_id, None)
+            except Exception as e:  # pragma: no cover - surfaced below
+                errors.append(e)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert plugin._invocations == {}
+
+
 class TestToolResultBlocking:
     @respx.mock
     async def test_blocked_result_is_withheld_from_model(self):
@@ -558,7 +753,7 @@ class TestResponseBlocking:
             response = json.loads(request.content)["response"]
             message = response["choices"][0]["message"]
             if message.get("content") and "hunter2" in message["content"]:
-                message["content"] = "Response blocked by policy"
+                message["content"] = "Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)"
             return httpx.Response(200, json=response)
 
         respx.post(RESPONSE_ENDPOINT).mock(side_effect=handler)
@@ -567,7 +762,7 @@ class TestResponseBlocking:
         events, _, _, _ = await _run([_say("The password is hunter2")])
 
         texts = _texts(events)
-        assert "Response blocked by policy" in texts
+        assert "Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)" in texts
         assert not any("hunter2" in t for t in texts)
 
 
@@ -801,7 +996,7 @@ class TestStreaming:
 
         def handler(request: httpx.Request) -> httpx.Response:
             response = json.loads(request.content)["response"]
-            response["choices"][0]["message"]["content"] = "Response blocked by policy"
+            response["choices"][0]["message"]["content"] = "Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)"
             return httpx.Response(200, json=response)
 
         response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=handler)
@@ -826,12 +1021,24 @@ class TestStreaming:
 
         assert len(response_route.calls) == 1
         assert _texts([e for e in events if e.partial]) == ["The password ", "is hunter2"]
-        assert _texts([e for e in events if not e.partial]) == ["Response blocked by policy"]
+        assert _texts([e for e in events if not e.partial]) == ["Response blocked by Rubrik Agent Cloud (Reference ID: ref-1)"]
         saved = await session_service.get_session(app_name="app", user_id="u", session_id=session.id)
         assert not any("hunter2" in t for t in _texts(saved.events))
 
 
 class TestPickling:
+    def test_pickle_drops_api_key(self):
+        import copy
+        import pickle
+
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, api_key="secret-key")
+        for restored in (pickle.loads(pickle.dumps(plugin)), copy.deepcopy(plugin)):
+            assert "secret-key" not in repr(restored.__dict__)
+            with patch.dict("os.environ", {"RUBRIK_API_KEY": "env-key"}):
+                client = restored._get_policy_client()
+            assert client._headers["Authorization"] == "Bearer env-key"
+        assert b"secret-key" not in pickle.dumps(plugin)
+
     def test_pickle_keeps_constructor_settings(self):
         import pickle
 
