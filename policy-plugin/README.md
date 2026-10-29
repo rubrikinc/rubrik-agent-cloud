@@ -60,7 +60,7 @@ adk api_server --extra_plugins rubrik_agent_cloud_policy.adk.RubrikPolicyPlugin 
 
 ## Configuration
 
-All options read configuration from environment variables:
+All options read configuration from environment variables. `RubrikPolicyPlugin(webhook_url=..., api_key=..., fail_open=..., agent_id=...)` overrides them; a setting you don't pass is read from its variable.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -82,7 +82,7 @@ The plugin checks four points in each ADK run. Each check sends the conversation
 | `before_tool_callback` | A tool call that `after_model_callback` did not check | `/v1/after_completion/openai/v1` | The tool does not run; the model receives an error result. |
 | `after_tool_callback` | Tool result | `/v1/before_prompt/openai/v1` | The model receives an error result instead of the tool output. |
 
-`before_tool_callback` is a safety net for tool calls that skip `after_model_callback`, which happens when another plugin's `before_model_callback` returns a cached response. A tool call that `after_model_callback` allowed, or let through when its check failed open, is not checked again. The approval is tied to that function call's ID, so it never covers a later call with the same arguments.
+`before_tool_callback` is a safety net for tool calls that skip `after_model_callback`, which happens when another plugin's `before_model_callback` returns a cached response. A tool call that `after_model_callback` allowed, or let through when its check failed open, is not checked again. The approval is tied to that function call's ID, name, and arguments: it never covers a later call with the same arguments, and a call whose arguments another callback rewrote is checked again.
 
 The plugin reads verdicts from the webhook's explicit signals. On `before_prompt`, the webhook returns `{}` to allow, or a refusal with `finish_reason: "content_filter"`. On `after_completion`, the tool calls it returns are the ones allowed, matched by ID. Blocked tool calls are explained by appended text that starts with `The following tool calls were blocked by Rubrik Agent Cloud:`, and a blocked response's content is replaced with text that starts with `Response blocked by Rubrik Agent Cloud`. If the webhook's output changes in any other way, the plugin logs a warning and blocks: a refusal without `content_filter` still refuses, and any other change to the response text blocks the whole response.
 
@@ -103,7 +103,7 @@ Limitations:
 
 If a check fails (the webhook is unreachable, times out, or returns a malformed response), the plugin **fails open** by default. Set `RUBRIK_POLICY_FAIL_OPEN=false` to fail closed: while checks fail, prompts, tool results, and model responses (text and tool calls) are replaced with a notice that the policy check is unavailable.
 
-Misconfiguration is not a check failure. Invalid constructor arguments raise when the plugin is created, and a missing `RUBRIK_WEBHOOK_URL` raises `RuntimeError` at the first callback.
+Misconfiguration is not a check failure. Unknown or invalid constructor arguments raise when the plugin is created. A missing `RUBRIK_WEBHOOK_URL` (when `webhook_url` isn't passed) raises `RuntimeError` at the first callback, as does a missing `RUBRIK_API_KEY` in a plugin that was created with `api_key` and then pickled.
 
 The webhook endpoints are the ones a LiteLLM proxy uses, so the credentials come from an Agent Cloud LiteLLM connection.
 
@@ -159,7 +159,7 @@ Agent Runtime sets `GOOGLE_CLOUD_AGENT_ENGINE_ID` to the reasoning engine ID. Th
 
 ### cloudpickle note
 
-Agent Runtime serializes plugins locally with `cloudpickle` and deserializes on the remote container. `RubrikPolicyClient` implements `__reduce__` so env vars like `RUBRIK_WEBHOOK_URL` are re-read on the remote side — not baked in from the local environment. A `RubrikPolicyPlugin` pickles its other constructor arguments but never `api_key`; the deployed plugin reads the key from `RUBRIK_API_KEY`.
+Agent Runtime serializes plugins locally with `cloudpickle` and deserializes on the remote container. `RubrikPolicyClient` implements `__reduce__` so env vars like `RUBRIK_WEBHOOK_URL` are re-read on the remote side — not baked in from the local environment. A `RubrikPolicyPlugin` pickles its other constructor arguments but never `api_key`; the deployed plugin reads the key from `RUBRIK_API_KEY`, and raises `RuntimeError` if it was created with `api_key` and the variable is unset, rather than failing every check with 401. A deep copy (`AdkApp.clone` deep-copies plugins before deploying) stays in the local process and keeps `api_key`.
 
 ## Direct Client Usage (Framework-Agnostic)
 

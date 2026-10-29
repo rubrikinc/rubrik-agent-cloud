@@ -12,6 +12,7 @@ Requires the ``adk`` extra::
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -53,9 +54,11 @@ class _InvocationState:
 
     # Latest model request per agent, used as the context of later checks.
     requests: dict[str, PolicyContext] = field(default_factory=dict)
-    # Function call IDs that after_model_callback allowed or failed open on.
-    # IDs are unique per call, so an approval never covers a later call.
-    approved_call_ids: set = field(default_factory=set)
+    # (ID, name, JSON arguments) of function calls that after_model_callback
+    # allowed or failed open on.  IDs are unique per call, so an approval
+    # never covers a later call; the name and arguments are part of the key,
+    # so a call that a later callback rewrites is checked again.
+    approved_calls: set[tuple[str, str, str]] = field(default_factory=set)
     # Function call IDs of tools that before_tool_callback blocked.
     blocked_call_ids: set = field(default_factory=set)
     # Refusal for a blocked user prompt, returned by before_run_callback.
@@ -68,9 +71,11 @@ class RubrikPolicyPlugin(BasePlugin):
     """ADK plugin for Rubrik Agent Cloud policy enforcement.
 
     Uses :class:`RubrikPolicyClient` to evaluate agent activity against the
-    Rubrik webhook service.  Configuration is read from environment variables.
-    Each check sends the conversation so far, the tools declared to the
-    model, and the agent ID.
+    Rubrik webhook service.  The constructor's ``webhook_url``, ``api_key``,
+    ``fail_open``, and ``agent_id`` override the environment variables that
+    :meth:`RubrikPolicyClient.from_env` reads; a setting that is not passed
+    is read from its variable.  Each check sends the conversation so far,
+    the tools declared to the model, and the agent ID.
 
     - ``on_user_message_callback`` and ``before_run_callback``: check a new
       user prompt before it is saved to the session.  A blocked prompt is
@@ -84,7 +89,8 @@ class RubrikPolicyPlugin(BasePlugin):
       calls are removed before ADK runs them; a blocked response is replaced
       with the refusal.
     - ``before_tool_callback``: safety net that checks a tool call before it
-      runs, unless ``after_model_callback`` already allowed the same call.
+      runs, unless ``after_model_callback`` already allowed that call with
+      the same name and arguments.
       This catches tool calls that bypassed ``after_model_callback``, which
       happens when another plugin's ``before_model_callback`` returns a
       cached response.
@@ -102,16 +108,19 @@ class RubrikPolicyPlugin(BasePlugin):
     model requests in this process.
 
     Any failure of a check, including a malformed webhook response, follows
-    ``fail_open``.  Misconfiguration raises instead: constructor arguments
-    are validated at construction, and without them a missing
-    ``RUBRIK_WEBHOOK_URL`` raises ``RuntimeError`` at the first callback.
+    ``fail_open``.  Misconfiguration raises instead: an unknown or invalid
+    constructor argument raises at construction, and a missing
+    ``RUBRIK_WEBHOOK_URL`` (when ``webhook_url`` is not passed) raises
+    ``RuntimeError`` at the first callback.
 
-    Without constructor arguments, the client is built on first use so the
-    plugin can be created locally (for cloudpickle) without
-    ``RUBRIK_WEBHOOK_URL``.  Pickling (and deep copying, which
-    ``AdkApp.clone`` does before deploying) drops the client and the
-    ``api_key`` argument; the restored plugin reads the key from
-    ``RUBRIK_API_KEY``.
+    Without ``webhook_url``, the client is built on first use so the plugin
+    can be created locally (for cloudpickle) without ``RUBRIK_WEBHOOK_URL``.
+    Pickling drops the client and the ``api_key`` argument; the restored
+    plugin reads the key from ``RUBRIK_API_KEY``, and raises
+    ``RuntimeError`` at the first callback if it was created with
+    ``api_key`` and the variable is unset.  A deep copy (``AdkApp.clone``
+    deep-copies plugins before deploying) stays in the process and keeps
+    the key.
 
     Callbacks may run concurrently on different threads (``Runner.run``
     runs each call on its own thread), so the per-invocation bookkeeping is
@@ -120,29 +129,39 @@ class RubrikPolicyPlugin(BasePlugin):
 
     PLUGIN_NAME = "rubrik_agent_cloud_policy"
 
-    def __init__(self, name: str = PLUGIN_NAME, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        name: str = PLUGIN_NAME,
+        *,
+        webhook_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        fail_open: Optional[bool] = None,
+        agent_id: Optional[str] = None,
+    ) -> None:
         super().__init__(name=name)
-        # Kept apart from the other settings so that pickling drops it.
-        self._api_key: Optional[str] = kwargs.pop("api_key", None)
-        self._kwargs = kwargs
+        # Settings for RubrikPolicyClient.from_env; omitted ones come from
+        # the environment.  The API key is kept apart so pickling drops it.
+        settings = {"webhook_url": webhook_url, "fail_open": fail_open, "agent_id": agent_id}
+        self._settings = {k: v for k, v in settings.items() if v is not None}
+        self._api_key = api_key
+        # Whether pickling dropped an api_key passed to the constructor.
+        self._api_key_dropped = False
         self._policy_client: Optional[RubrikPolicyClient] = None
         self._lock = threading.Lock()
         self._invocations: dict[str, _InvocationState] = {}
         # Invocation IDs whose prompt was blocked after ADK saved it.
         self._redacted_invocations: dict[str, None] = {}
-        if kwargs or self._api_key:
-            # Validate explicit settings now. Without them, defer: the
+        if webhook_url is not None:
+            # Validate explicit settings now. Without a URL, defer: the
             # environment may lack RUBRIK_WEBHOOK_URL at pickle time.
             self._get_policy_client()
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
+        # A pickled plugin is deployed elsewhere; never serialize the key.
+        state = self._copyable_state()
         state.update(
             _api_key=None,
-            _policy_client=None,
-            _lock=None,
-            _invocations={},
-            _redacted_invocations={},
+            _api_key_dropped=self._api_key_dropped or self._api_key is not None,
         )
         return state
 
@@ -150,14 +169,36 @@ class RubrikPolicyPlugin(BasePlugin):
         self.__dict__.update(state)
         self._lock = threading.Lock()
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> RubrikPolicyPlugin:
+        # A deep copy stays in this process, so it keeps the API key.
+        clone = self.__class__.__new__(self.__class__)
+        memo[id(self)] = clone
+        clone.__setstate__(copy.deepcopy(self._copyable_state(), memo))
+        return clone
+
+    def _copyable_state(self) -> dict[str, Any]:
+        """``__dict__`` without the client, the lock, and run bookkeeping."""
+        state = self.__dict__.copy()
+        state.update(
+            _policy_client=None,
+            _lock=None,
+            _invocations={},
+            _redacted_invocations={},
+        )
+        return state
+
     def _get_policy_client(self) -> RubrikPolicyClient:
         with self._lock:
             if self._policy_client is None:
-                if self._kwargs or self._api_key:
-                    api_key = self._api_key or os.getenv(RubrikPolicyClient._API_KEY_ENV)
-                    self._policy_client = RubrikPolicyClient(api_key=api_key, **self._kwargs)
-                else:
-                    self._policy_client = RubrikPolicyClient.from_env()
+                api_key_env = RubrikPolicyClient._API_KEY_ENV
+                if self._api_key_dropped and not os.getenv(api_key_env):
+                    raise RuntimeError(
+                        f"{api_key_env} must be set. The plugin was created with api_key, "
+                        "which is not pickled; supply the key in the deployment's environment."
+                    )
+                self._policy_client = RubrikPolicyClient.from_env(
+                    api_key=self._api_key, **self._settings
+                )
             return self._policy_client
 
     def _state(self, ctx: Any) -> _InvocationState:
@@ -343,16 +384,17 @@ class RubrikPolicyPlugin(BasePlugin):
         response, causing ADK to skip the entire ``after_model_callback``
         chain.
         """
-        call_id = getattr(tool_context, "function_call_id", None) or ""
+        arguments = _json_args(tool_args)
+        call = (getattr(tool_context, "function_call_id", None) or "", tool.name, arguments)
         with self._lock:
-            approved = self._state(tool_context).approved_call_ids
-            if call_id in approved:
-                approved.discard(call_id)
+            approved = self._state(tool_context).approved_calls
+            if call in approved:
+                approved.discard(call)
                 return None
 
         client = self._get_policy_client()
         try:
-            tc = ToolCall(name=tool.name, arguments=json.dumps(tool_args or {}, default=str))
+            tc = ToolCall(name=tool.name, arguments=arguments)
             context = self._session_context(tool_context)
             result = await client.evaluate_tool_calls([tc], context)
         except Exception:
@@ -502,7 +544,9 @@ class RubrikPolicyPlugin(BasePlugin):
     def _approve(self, ctx: Any, tool_calls: Iterable[ToolCall]) -> None:
         """Let ``before_tool_callback`` skip these calls of the current response."""
         with self._lock:
-            self._state(ctx).approved_call_ids.update(tc.id for tc in tool_calls)
+            self._state(ctx).approved_calls.update(
+                (tc.id, tc.name, tc.arguments) for tc in tool_calls
+            )
 
     def _mark_blocked(self, tool_context: Any) -> None:
         call_id = getattr(tool_context, "function_call_id", None)

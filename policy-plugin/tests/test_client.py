@@ -670,3 +670,15 @@ class TestClientConfiguration:
     def test_from_env_raises_without_url(self):
         with pytest.raises(RuntimeError, match="RUBRIK_WEBHOOK_URL must be set"):
             RubrikPolicyClient.from_env()
+
+    @patch.dict(
+        "os.environ",
+        {"RUBRIK_POLICY_FAIL_OPEN": "false", "RUBRIK_AGENT_ID": "env-agent"},
+        clear=True,
+    )
+    def test_from_env_arguments_override_env(self):
+        client = RubrikPolicyClient.from_env(webhook_url=WEBHOOK_URL, fail_open=True)
+        assert client._tool_blocking_endpoint == ENDPOINT
+        assert client.fail_open is True
+        assert client.agent_id == "env-agent"
+        assert "Authorization" not in client._headers

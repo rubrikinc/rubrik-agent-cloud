@@ -26,6 +26,7 @@ from rubrik_agent_cloud_policy.adk import (
     _contents_to_messages,
     _gemini_parts_to_tool_calls,
 )
+from rubrik_agent_cloud_policy.client import ToolCall
 
 WEBHOOK_URL = "https://webhook.example.com"
 RESPONSE_ENDPOINT = f"{WEBHOOK_URL}/v1/after_completion/openai/v1"
@@ -441,6 +442,36 @@ class TestToolCalls:
         ) is None
         assert len(respx.calls) == 1
 
+    @respx.mock
+    async def test_rewritten_arguments_are_checked_again(self):
+        """An approval covers the call's name and arguments, not only its ID.
+
+        A callback that runs after after_model_callback may rewrite a call's
+        arguments and keep its ID; the rewritten call must still be checked.
+        """
+        response_route = respx.post(RESPONSE_ENDPOINT).mock(side_effect=_allow_all)
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL)
+
+        class Ctx:
+            invocation_id = "inv-1"
+            agent_name = "test_agent"
+
+        ctx = Ctx()
+        response = LlmResponse(content=_call("post_to_pastebin", content="hello"))
+        await plugin.after_model_callback(callback_context=ctx, llm_response=response)
+        ctx.function_call_id = response.content.parts[0].function_call.id
+
+        respx.post(RESPONSE_ENDPOINT).mock(side_effect=_block_tool("post_to_pastebin"))
+        tool = type("Tool", (), {"name": "post_to_pastebin"})()
+        refusal = await plugin.before_tool_callback(
+            tool=tool, tool_args={"content": "hunter2"}, tool_context=ctx
+        )
+
+        assert refusal is not None and "blocked by Rubrik Agent Cloud" in refusal["error"]
+        assert len(response_route.calls) == 2
+        sent = _bodies(response_route)[1]["response"]["choices"][0]["message"]["tool_calls"]
+        assert json.loads(sent[0]["function"]["arguments"]) == {"content": "hunter2"}
+
 
 # -- safety net ---------------------------------------------------------------------
 
@@ -669,7 +700,7 @@ class TestConcurrency:
             try:
                 for _ in range(200):
                     ctx = Ctx(i)
-                    plugin._approve(ctx, [type("TC", (), {"id": ctx.function_call_id})()])
+                    plugin._approve(ctx, [ToolCall(name="t", arguments="{}", id=ctx.function_call_id)])
                     plugin._mark_blocked(ctx)
                     with plugin._lock:
                         plugin._invocations.pop(ctx.invocation_id, None)
@@ -773,6 +804,32 @@ class TestConfiguration:
     def test_invalid_constructor_settings_raise_at_construction(self):
         with pytest.raises(ValueError, match="webhook_url is required"):
             RubrikPolicyPlugin(webhook_url="")
+
+    def test_unknown_constructor_argument_raises(self):
+        with pytest.raises(TypeError):
+            RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_closed=True)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "RUBRIK_WEBHOOK_URL": "https://env.example.com",
+            "RUBRIK_API_KEY": "env-key",
+            "RUBRIK_POLICY_FAIL_OPEN": "false",
+            "RUBRIK_AGENT_ID": "env-agent",
+        },
+    )
+    def test_settings_not_passed_are_read_from_env(self):
+        client = RubrikPolicyPlugin(api_key="explicit-key")._get_policy_client()
+        assert client._prompt_endpoint == "https://env.example.com/v1/before_prompt/openai/v1"
+        assert client._headers["Authorization"] == "Bearer explicit-key"
+        assert client.fail_open is False
+        assert client.agent_id == "env-agent"
+
+        client = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, fail_open=True)._get_policy_client()
+        assert client._prompt_endpoint == PROMPT_ENDPOINT
+        assert client._headers["Authorization"] == "Bearer env-key"
+        assert client.fail_open is True
+        assert client.agent_id == "env-agent"
 
     @patch.dict("os.environ", {}, clear=True)
     async def test_missing_env_raises_clear_error(self):
@@ -1028,16 +1085,43 @@ class TestStreaming:
 
 class TestPickling:
     def test_pickle_drops_api_key(self):
-        import copy
         import pickle
 
         plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, api_key="secret-key")
-        for restored in (pickle.loads(pickle.dumps(plugin)), copy.deepcopy(plugin)):
-            assert "secret-key" not in repr(restored.__dict__)
-            with patch.dict("os.environ", {"RUBRIK_API_KEY": "env-key"}):
-                client = restored._get_policy_client()
-            assert client._headers["Authorization"] == "Bearer env-key"
-        assert b"secret-key" not in pickle.dumps(plugin)
+        data = pickle.dumps(plugin)
+        assert b"secret-key" not in data
+        restored = pickle.loads(data)
+        assert "secret-key" not in repr(restored.__dict__)
+        with patch.dict("os.environ", {"RUBRIK_API_KEY": "env-key"}):
+            client = restored._get_policy_client()
+        assert client._headers["Authorization"] == "Bearer env-key"
+
+    @patch.dict("os.environ", {}, clear=True)
+    async def test_pickled_plugin_without_key_raises_instead_of_failing_open(self):
+        """A dropped api_key with no RUBRIK_API_KEY would 401 every check."""
+        import pickle
+
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, api_key="secret-key")
+        restored = pickle.loads(pickle.dumps(pickle.loads(pickle.dumps(plugin))))
+        with pytest.raises(RuntimeError, match="RUBRIK_API_KEY must be set"):
+            await restored.after_model_callback(
+                callback_context=None, llm_response=LlmResponse(content=_say("hi"))
+            )
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_deepcopy_keeps_api_key(self):
+        """AdkApp.clone deep-copies plugins in the same process."""
+        import copy
+
+        plugin = RubrikPolicyPlugin(webhook_url=WEBHOOK_URL, api_key="secret-key")
+        clone = copy.deepcopy(plugin)
+        assert clone._get_policy_client() is not plugin._get_policy_client()
+        assert clone._get_policy_client()._headers["Authorization"] == "Bearer secret-key"
+        assert clone._lock is not plugin._lock
+        # The clone is still deployable: pickling it drops the key.
+        import pickle
+
+        assert b"secret-key" not in pickle.dumps(clone)
 
     def test_pickle_keeps_constructor_settings(self):
         import pickle

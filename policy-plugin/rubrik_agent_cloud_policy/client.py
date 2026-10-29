@@ -120,25 +120,38 @@ class RubrikPolicyClient:
         )
 
     @classmethod
-    def from_env(cls) -> RubrikPolicyClient:
+    def from_env(
+        cls,
+        *,
+        webhook_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        fail_open: Optional[bool] = None,
+        agent_id: Optional[str] = None,
+    ) -> RubrikPolicyClient:
         """Construct from environment variables.
 
         Reads ``RUBRIK_WEBHOOK_URL``, ``RUBRIK_API_KEY``,
         ``RUBRIK_POLICY_FAIL_OPEN``, and ``RUBRIK_AGENT_ID`` from the
         environment. ``RUBRIK_AGENT_ID`` defaults to
-        ``GOOGLE_CLOUD_AGENT_ENGINE_ID``.
+        ``GOOGLE_CLOUD_AGENT_ENGINE_ID``. An argument that is not ``None``
+        is used instead of its variable.
 
-        Raises ``RuntimeError`` if ``RUBRIK_WEBHOOK_URL`` is not set.
+        Raises ``RuntimeError`` if ``webhook_url`` is not passed and
+        ``RUBRIK_WEBHOOK_URL`` is not set.
         """
-        webhook_url = os.getenv(cls._WEBHOOK_URL_ENV, "")
-        if not webhook_url:
-            raise RuntimeError(
-                f"{cls._WEBHOOK_URL_ENV} must be set. "
-                "The rubrik-agent-cloud-policy-plugin is installed but has no webhook to connect to."
-            )
-        api_key = os.getenv(cls._API_KEY_ENV)
-        fail_open = os.getenv(cls._FAIL_OPEN_ENV, "true").lower() != "false"
-        agent_id = os.getenv(cls._AGENT_ID_ENV) or os.getenv(cls._AGENT_ENGINE_ID_ENV, "")
+        if webhook_url is None:
+            webhook_url = os.getenv(cls._WEBHOOK_URL_ENV, "")
+            if not webhook_url:
+                raise RuntimeError(
+                    f"{cls._WEBHOOK_URL_ENV} must be set. "
+                    "The rubrik-agent-cloud-policy-plugin is installed but has no webhook to connect to."
+                )
+        if api_key is None:
+            api_key = os.getenv(cls._API_KEY_ENV)
+        if fail_open is None:
+            fail_open = os.getenv(cls._FAIL_OPEN_ENV, "true").lower() != "false"
+        if agent_id is None:
+            agent_id = os.getenv(cls._AGENT_ID_ENV) or os.getenv(cls._AGENT_ENGINE_ID_ENV, "")
         return cls(
             webhook_url=webhook_url,
             api_key=api_key,
