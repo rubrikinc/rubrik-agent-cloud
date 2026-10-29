@@ -5,22 +5,16 @@ Usage:
     gcloud auth login
     gcloud auth application-default login
 
-    # Build the wheel (if not already built)
-    cd policy-plugin && python -m build
-
-    # Upload wheel to GCS (Agent Engine build needs HTTP access)
-    gsutil cp dist/rubrik_agent_cloud_policy_plugin-*.whl gs://<bucket>/packages/
-    gsutil acl ch -u AllUsers:R gs://<bucket>/packages/rubrik_agent_cloud_policy_plugin-*.whl
-
-    # Deploy
-    RUBRIK_WEBHOOK_URL=https://webhooks.your-dataplane.example.com \
-    GOOGLE_API_KEY=<gemini-key> \
-    python -m examples.test_agent.deploy --wheel-url https://storage.googleapis.com/<bucket>/packages/rubrik_agent_cloud_policy_plugin-0.1.1-py3-none-any.whl
+    # Store the webhook API key in Secret Manager and grant the Reasoning
+    # Engine Service Agent access (see the README), then deploy:
+    RUBRIK_WEBHOOK_URL=https://webhooks.your-dataplane.example.com/<tenant>/<webhook>/ \
+    python -m examples.test_agent.deploy --api-key-secret rubrik-agent-cloud-webhook-key
 """
 
 import argparse
 import logging
 import os
+from importlib.metadata import version
 
 import vertexai
 from vertexai import agent_engines
@@ -36,10 +30,8 @@ DEFAULT_LOCATION = "us-central1"
 DEFAULT_BUCKET = f"gs://{DEFAULT_PROJECT}-adk-staging"
 
 
-def deploy(project: str, location: str, bucket: str, wheel_url: str) -> str:
+def deploy(project: str, location: str, bucket: str, api_key_secret: str) -> str:
     webhook_url = os.environ.get("RUBRIK_WEBHOOK_URL", "")
-    api_key = os.environ.get("RUBRIK_API_KEY", "")
-    google_api_key = os.environ.get("GOOGLE_API_KEY", "")
     if not webhook_url:
         raise SystemExit(
             "RUBRIK_WEBHOOK_URL must be set. Example:\n"
@@ -55,21 +47,20 @@ def deploy(project: str, location: str, bucket: str, wheel_url: str) -> str:
 
     log.info("Deploying to %s/%s ...", project, location)
 
-    env_vars = {"RUBRIK_WEBHOOK_URL": webhook_url}
-    if api_key:
-        env_vars["RUBRIK_API_KEY"] = api_key
-    if google_api_key:
-        env_vars["GOOGLE_API_KEY"] = google_api_key
-
-    # Build requirements — use wheel URL if provided (package not yet on PyPI)
+    # Do not set GOOGLE_API_KEY: Agent Runtime authenticates with its service
+    # account, and an API key conflicts with the session service.
+    env_vars = {
+        "RUBRIK_WEBHOOK_URL": webhook_url,
+        "RUBRIK_API_KEY": {"secret": api_key_secret, "version": "latest"},
+    }
+    # Pin the plugin to the version installed here, which is what was
+    # pickled. Agent Runtime installs it from PyPI, so local changes must be
+    # released before they can be deployed.
+    plugin_version = version("rubrik-agent-cloud-policy-plugin")
     requirements = [
-        "google-cloud-aiplatform>=1.142.0",
-        "google-genai>=1.51.0",
+        "google-cloud-aiplatform[agent-engines,adk]>=1.142.0",
+        f"rubrik-agent-cloud-policy-plugin[adk]=={plugin_version}",
     ]
-    if wheel_url:
-        requirements.insert(0, f"rubrik-agent-cloud-policy-plugin[adk] @ {wheel_url}")
-    else:
-        requirements.insert(0, "rubrik-agent-cloud-policy-plugin[adk]")
 
     remote_app = agent_engines.create(
         agent_engine=adk_app,
@@ -88,10 +79,14 @@ def main():
     parser.add_argument("--project", default=DEFAULT_PROJECT)
     parser.add_argument("--location", default=DEFAULT_LOCATION)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
-    parser.add_argument("--wheel-url", default="", help="HTTPS URL to the rubrik-agent-cloud-policy-plugin wheel (for pre-PyPI deploys)")
+    parser.add_argument(
+        "--api-key-secret",
+        required=True,
+        help="Secret Manager secret that holds the webhook API key",
+    )
     args = parser.parse_args()
 
-    resource_name = deploy(args.project, args.location, args.bucket, args.wheel_url)
+    resource_name = deploy(args.project, args.location, args.bucket, args.api_key_secret)
     print(f"\nAgent deployed: {resource_name}")
     print(f"View at: https://console.cloud.google.com/vertex-ai/agents/agent-engines?project={args.project}")
 

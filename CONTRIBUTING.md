@@ -54,9 +54,9 @@ The PyPI publish step uses [trusted publishing](https://docs.pypi.org/trusted-pu
    with owner `rubrikinc`, repository `rubrik-agent-cloud`, workflow `policy-plugin-release.yml`, and environment `pypi`.
 2. In the GitHub repo settings: create an environment named `pypi` (Settings > Environments > New environment).
 
-### Deploying to Vertex AI Agent Engine
+### Deploying to Vertex AI Agent Runtime
 
-For deploying the plugin with an ADK agent to Agent Engine, see
+For deploying the plugin with an ADK agent to Agent Runtime, see
 [the deploy example](policy-plugin/examples/test_agent/deploy.py) and the
-"Deploy to Vertex AI Agent Engine" section in the
-[policy-plugin README](policy-plugin/README.md#deploy-to-vertex-ai-agent-engine).
+"Deploy to Vertex AI Agent Runtime" section in the
+[policy-plugin README](policy-plugin/README.md#deploy-to-vertex-ai-agent-runtime).
